@@ -14,4 +14,5 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("format.zig");
+    _ = @import("packer.zig");
 }

@@ -36,6 +36,11 @@ pub const Footer = extern struct {
     table_offset: u64,
     variant_count: u32,
     format_version: u32,
+    /// ELF `e_machine` of the stub and payloads. The packer stamps it from
+    /// the stub's own ELF header; the stub validates it against its own
+    /// arch before trusting anything else in the file.
+    machine: u16,
+    _pad: [6]u8 = @splat(0),
 };
 
 /// One per variant, in match order (table order = config file order).
@@ -78,8 +83,9 @@ pub const Error = error{
 comptime {
     // Wire layout is pinned by these asserts; changing it is a
     // `format_version` bump.
-    assert(@sizeOf(Footer) == 24);
+    assert(@sizeOf(Footer) == 32);
     assert(@offsetOf(Footer, "table_offset") == 8);
+    assert(@offsetOf(Footer, "machine") == 24);
     assert(@sizeOf(VariantEntry) == 32);
     assert(@offsetOf(VariantEntry, "payload_size") == 8);
     assert(@offsetOf(VariantEntry, "is_default") == 24);
@@ -177,12 +183,15 @@ test "footer encode pins little-endian byte layout" {
         .table_offset = 0x0102_0304_0506_0708,
         .variant_count = 0x090a_0b0c,
         .format_version = 0x0d0e_0f10,
+        .machine = 0x1415,
     };
     const bytes = encode(Footer, footer);
     try testing.expectEqualSlices(u8, &[_]u8{
         'C',  'H',  'O',  'N',  'K',  'v',  '0',  '1',
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-        0x0c, 0x0b, 0x0a, 0x09, 0x10, 0x0f, 0x0e, 0x0d,
+        0x0c, 0x0b, 0x0a, 0x09,
+        0x10, 0x0f, 0x0e, 0x0d,
+        0x15, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     }, &bytes);
 }
 
@@ -192,6 +201,7 @@ test "footer round-trip" {
         .table_offset = 0x1234_5678_9abc_def0,
         .variant_count = 3,
         .format_version = format_version,
+        .machine = 0xb7,
     };
     const bytes = encode(Footer, footer);
     try testing.expectEqual(footer, try decode(Footer, &bytes));
@@ -232,6 +242,7 @@ test "decode rejects truncated buffer" {
         .table_offset = 0,
         .variant_count = 0,
         .format_version = format_version,
+        .machine = 0xb7,
     });
     try testing.expectError(error.Truncated, decode(Footer, bytes[0 .. bytes.len - 1]));
 }
@@ -243,6 +254,7 @@ test "findFooter at EOF" {
         .table_offset = 8,
         .variant_count = 2,
         .format_version = format_version,
+        .machine = @intFromEnum(std.elf.EM.AARCH64),
     };
     const footer_bytes = encode(Footer, footer);
     var fat: [payload.len + footer_bytes.len]u8 = undefined;
@@ -260,6 +272,7 @@ test "findFooter rejects short file, bad magic, bad version" {
         .table_offset = 0,
         .variant_count = 0,
         .format_version = format_version + 1,
+        .machine = 0xb7,
     });
     try testing.expectError(error.UnsupportedVersion, findFooter(&wrong_version));
 }

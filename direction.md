@@ -1,8 +1,8 @@
 # Fat Binary Dispatcher — Project Plan
 
-A single self-contained Linux/aarch64 binary that detects the running CPU
-(Neoverse V1 vs V2, etc.) and re-execs into an embedded, optimized payload —
-no libc, no IFUNC, no dynamic linker involved. Think "macOS universal binary,"
+A single self-contained Linux binary — aarch64 (Neoverse V1 vs V2, etc.) and
+x86_64 — that detects the running CPU and re-execs into an embedded,
+optimized payload — no libc, no IFUNC, no dynamic linker involved. Think "macOS universal binary,"
 but built from scratch for our use case and driven by a small packer tool +
 config file instead of a fixed Apple-defined format.
 
@@ -68,6 +68,9 @@ struct Footer {
     uint64_t table_offset;  // absolute file offset of VariantEntry[0]
     uint32_t variant_count;
     uint32_t format_version;
+    uint16_t machine;       // ELF e_machine — packer stamps from stub ELF,
+                            // stub validates against its own arch
+    uint8_t  _pad[6];
 };
 
 // One per variant, table_offset .. table_offset + count * sizeof(VariantEntry)
@@ -170,7 +173,8 @@ Packer responsibilities:
    config stays human-readable instead of raw hex masks.
 2. Validate: exactly one `default: true`, all `binary:` paths exist, no
    duplicate variant names.
-3. Read `stub` binary bytes.
+3. Read `stub` binary bytes; validate stub + payload ELF `e_machine` agree
+   and stamp it into the footer (the arch-blind species check).
 4. For each variant, page-align the running offset, read payload bytes,
    record `(offset, size)`.
 5. Emit condition blob + variant table + footer per the shared struct
@@ -225,7 +229,12 @@ in order of preference:
 7. Add `MIDR_EL1` read as a tiebreak source, test on real Neoverse V1/V2
    hardware (or under QEMU if that's what's available) to confirm the HWCAP2
    SVE2 bit genuinely separates V1 from V2 the way we expect.
-8. Nice-to-haves: `packer inspect`, streaming payload read instead of
+8. x86_64 twin: port the entry trampoline (~10 lines of asm — see
+   std.start's x86_64 branch), design the CPUID condition source, cross-build
+   in CI. Detection is trivial on x86 (unprivileged CPUID) but the dispatch
+   problem (no libc, no dynamic linker) is arch-independent — that's why x86
+   still gets the fat binary treatment.
+9. Nice-to-haves: `packer inspect`, streaming payload read instead of
    whole-file buffering, mmap+exec as a faster alternative dispatch path.
 
 ---
@@ -237,6 +246,9 @@ in order of preference:
 - Whether `/proc/self/exe` readlink is reliable enough across however this
   gets invoked (containers, chroots) or whether we need an `argv[0]` /
   `AT_EXECFN` fallback too.
+- How to encode CPUID conditions (leaf/subleaf/register/bit) into the
+  existing `Condition` mask/expected pair — x86 needs a richer vocabulary
+  than aarch64's hwcap mask.
 - Max payload size we're comfortable reading fully into memory vs. when
   streaming into the memfd becomes worth the complexity.
 - Whether we ever want more than AND-of-conditions-per-variant match logic —
