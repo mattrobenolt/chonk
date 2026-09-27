@@ -1,15 +1,24 @@
-//! Freestanding dispatcher prototype (direction.md §7 step 2): naked `_start`
-//! walks the initial stack — argc / argv / envp / auxv — reads AT_HWCAP and
-//! AT_HWCAP2, prints both, exits. No libc, no CRT; the only kernel calls are
-//! raw `write` and `exit_group`.
+//! Freestanding dispatcher (direction.md §7 step 4): the naked `_start`
+//! walks the initial stack, finds its own file via AT_EXECFN, reads the
+//! trailer from EOF, streams the payload into a memfd, and execveat's into
+//! it — passing the ORIGINAL argv/envp through untouched. No libc, no CRT;
+//! the only kernel calls are raw syscalls.
+//!
+//! v0 semantics: the fat binary carries exactly one variant with no
+//! conditions, so "dispatch" means "use it". Step 6 replaces that with the
+//! real first-match walk over the entry table.
 
 const std = @import("std");
 const linux = std.os.linux;
 const elf = std.elf;
+const format = @import("format.zig");
 
-/// Kernel entry point. `callconv(.naked)` = the compiler emits ONLY this asm,
-/// no prologue, so sp still points at the initial stack block the kernel
-/// built:
+/// This stub's species — the x86_64 twin switches this at comptime.
+const my_machine: u16 = @intFromEnum(elf.EM.AARCH64);
+
+/// Kernel entry point. `callconv(.naked)` = the compiler emits ONLY this
+/// asm, no prologue, so sp still points at the initial stack block the
+/// kernel built:
 ///
 ///   [argc: u64][argv[0..argc]: u64 ptrs][NULL][envp: u64 ptrs][NULL]
 ///   [auxv: (a_type, a_val) u64 pairs...][AT_NULL, 0]
@@ -30,11 +39,12 @@ export fn _start() callconv(.naked) noreturn {
     );
 }
 
-/// Walk the initial stack. x0 on entry = the original sp (see `_start`).
+/// Walk the initial stack (x0 = the original sp), then dispatch.
 fn walk(argc_argv_ptr: [*]usize) callconv(.c) noreturn {
-    // Nothing is initialized yet (no TLS) — a safety panic here would itself
-    // crash before it could report anything, so the walk runs with runtime
-    // safety off. Same call std.start makes.
+    // Same posture as std.start: no TLS exists yet, so a safety panic would
+    // itself crash before it could report anything. The walk and dispatch
+    // run with runtime safety off; the trailer's explicit validation still
+    // guards every read.
     @setRuntimeSafety(false);
 
     const argc = argc_argv_ptr[0];
@@ -48,72 +58,141 @@ fn walk(argc_argv_ptr: [*]usize) callconv(.c) noreturn {
     // auxv: (a_type, a_val) pairs, right after envp's NULL terminator.
     const auxv: [*]const elf.Auxv = @ptrCast(@alignCast(envp + envp_count + 1));
 
-    var hwcap: u64 = 0;
-    var hwcap2: u64 = 0;
+    // AT_EXECFN points at the kernel's own record of the file it exec'd —
+    // the honest way to find ourselves. argv[0] is caller-controlled and
+    // readlink("/proc/self/exe") needs /proc mounted; AT_EXECFN needs neither.
+    // (Step 6 will scrape AT_HWCAP/AT_HWCAP2 here again, for conditions.)
+    var execfn: ?[*:0]const u8 = null;
     var i: usize = 0;
     while (auxv[i].a_type != elf.AT_NULL) : (i += 1) {
-        switch (auxv[i].a_type) {
-            elf.AT_HWCAP => hwcap = auxv[i].a_un.a_val,
-            elf.AT_HWCAP2 => hwcap2 = auxv[i].a_un.a_val,
-            else => {},
+        if (auxv[i].a_type == elf.AT_EXECFN) {
+            execfn = @ptrFromInt(auxv[i].a_un.a_val);
         }
     }
 
-    // Report, e.g.: argc=1 hwcap=0xeff3ffff hwcap2=0x801bf3bf
-    var line: [80]u8 = undefined;
-    var w: Writer = .{ .buf = &line };
-    w.append("argc=");
-    w.dec(argc);
-    w.append(" hwcap=0x");
-    w.hex(hwcap);
-    w.append(" hwcap2=0x");
-    w.hex(hwcap2);
-    w.append("\n");
+    const path = execfn orelse fatal("no AT_EXECFN in auxv");
+    dispatch(path, argv, envp);
+}
 
-    // Prototype: if the write fails there is nothing left to do anyway.
-    _ = linux.write(1, w.constSlice().ptr, w.constSlice().len);
-    linux.exit_group(0);
+fn dispatch(
+    path: [*:0]const u8,
+    argv: [*]const ?[*:0]const u8,
+    envp: [*]const ?[*:0]const u8,
+) noreturn {
+    @setRuntimeSafety(false);
+
+    const fat_rc = linux.openat(linux.AT.FDCWD, path, .{}, 0);
+    if (linux.errno(fat_rc) != .SUCCESS) fatalSyscall("openat self", fat_rc);
+    const fat_fd: linux.fd_t = @intCast(fat_rc);
+
+    const size_rc = linux.lseek(fat_fd, 0, linux.SEEK.END);
+    if (linux.errno(size_rc) != .SUCCESS) fatalSyscall("lseek self", size_rc);
+    const file_size: u64 = @bitCast(size_rc);
+
+    // Footer: always the last @sizeOf(Footer) bytes.
+    var footer_bytes: [@sizeOf(format.Footer)]u8 = undefined;
+    preadFull(fat_fd, &footer_bytes, @as(i64, @bitCast(file_size)) - @sizeOf(format.Footer));
+    const footer = format.decode(format.Footer, &footer_bytes) catch
+        fatal("footer does not decode");
+    if (footer.magic != format.magic) fatal("bad footer magic — not a chonk binary");
+    if (footer.format_version != format.format_version) fatal("unsupported trailer format version");
+    if (footer.machine != my_machine) fatal("trailer is for a different machine");
+    if (footer.variant_count != 1) fatal("this stub dispatches exactly one variant");
+
+    // Entry table. Offset sanity first — the trailer is untrusted input;
+    // every arithmetic below leans on these checks.
+    if (footer.table_offset > file_size - @as(u64, @sizeOf(format.VariantEntry)))
+        fatal("entry table out of range");
+    var entry_bytes: [@sizeOf(format.VariantEntry)]u8 = undefined;
+    preadFull(fat_fd, &entry_bytes, @intCast(footer.table_offset));
+    const entry = format.decode(format.VariantEntry, &entry_bytes) catch
+        fatal("entry does not decode");
+    if (entry.condition_count != 0) fatal("this stub does not evaluate conditions yet");
+
+    // Payload must fit strictly between its offset and the entry table.
+    if (entry.payload_offset >= footer.table_offset or
+        entry.payload_size > footer.table_offset - entry.payload_offset)
+        fatal("payload out of range");
+
+    // Stream the payload into a fresh memfd. sendfile does the copying in
+    // the kernel — no userspace buffer, no whole-file residency.
+    const name: [*:0]const u8 = "chonk-payload";
+    const mem_rc = linux.memfd_create(name, linux.MFD.CLOEXEC);
+    if (linux.errno(mem_rc) != .SUCCESS) fatalSyscall("memfd_create", mem_rc);
+    const mem_fd: linux.fd_t = @intCast(mem_rc);
+
+    var sent_off: i64 = @intCast(entry.payload_offset);
+    var remaining: u64 = entry.payload_size;
+    while (remaining > 0) {
+        const sent = linux.sendfile(mem_fd, fat_fd, &sent_off, @intCast(remaining));
+        if (linux.errno(sent) != .SUCCESS) fatalSyscall("sendfile", sent);
+        if (sent == 0) fatal("fat binary truncated inside payload");
+        remaining -= @intCast(sent);
+    }
+
+    // Become the payload. AT_EMPTY_PATH + the memfd: no /proc mount needed,
+    // no path resolution at all. argv/envp pass through exactly as the
+    // kernel handed them to us — same pointers, same order, same NULLs.
+    const exec_rc = linux.execveat(
+        mem_fd,
+        "",
+        @ptrCast(argv),
+        @ptrCast(envp),
+        .{ .SYMLINK_NOFOLLOW = false, .EMPTY_PATH = true },
+    );
+    // Success never returns.
+    fatalSyscall("execveat", exec_rc);
+}
+
+/// Read exactly `buf.len` bytes at `offset` from `fd`. Any shortfall is
+/// fatal — the trailer is trusted with nothing.
+fn preadFull(fd: linux.fd_t, buf: []u8, offset: i64) void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const read_at = offset + @as(i64, @intCast(done));
+        const rc = linux.pread(fd, buf.ptr + done, buf.len - done, read_at);
+        if (linux.errno(rc) != .SUCCESS) fatalSyscall("pread", rc);
+        if (rc == 0) fatal("fat binary truncated (short read)");
+        done += rc;
+    }
+}
+
+/// Report to stderr and die — the only exit that is not execveat.
+fn fatal(comptime what: []const u8) noreturn {
+    var stderr_buffer: [128]u8 = undefined;
+    var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
+    w.append("chonk: ");
+    w.append(what);
+    w.append("\n");
+    _ = linux.write(w.fd, w.slice().ptr, w.slice().len);
+    linux.exit_group(1);
+}
+
+fn fatalSyscall(comptime what: []const u8, rc: usize) noreturn {
+    var stderr_buffer: [160]u8 = undefined;
+    var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
+    w.append("chonk: ");
+    w.append(what);
+    w.append(": ");
+    w.append(@tagName(linux.errno(rc)));
+    w.append("\n");
+    _ = linux.write(w.fd, w.slice().ptr, w.slice().len);
+    linux.exit_group(1);
 }
 
 /// Fixed-buffer writer — no allocator, no std.Io, nothing but us. Bounded by
-/// construction: the report line fits `line`'s 80 bytes with room to spare.
+/// construction: every message fits its buffer with room to spare.
 const Writer = struct {
+    fd: linux.fd_t,
     buf: []u8,
-    len: u8 = 0,
+    len: usize = 0,
 
     fn append(w: *Writer, s: []const u8) void {
         @memcpy(w.buf[w.len..][0..s.len], s);
-        w.len += @intCast(s.len);
+        w.len += s.len;
     }
 
-    fn hex(w: *Writer, val: u64) void {
-        const digits = "0123456789abcdef";
-        for (0..16) |i| {
-            const digit: u4 = @truncate(val >> @intCast(60 - 4 * i));
-            w.buf[w.len] = digits[digit];
-            w.len += 1;
-        }
-    }
-
-    fn dec(w: *Writer, val: u64) void {
-        // u64 max is 20 digits. Emit reversed, then reverse in place.
-        var tmp: [20]u8 = undefined;
-        var n: usize = 0;
-        var v = val;
-        while (true) {
-            tmp[n] = @intCast('0' + v % 10);
-            n += 1;
-            v /= 10;
-            if (v == 0) break;
-        }
-        while (n > 0) {
-            n -= 1;
-            w.buf[w.len] = tmp[n];
-            w.len += 1;
-        }
-    }
-
-    fn constSlice(w: *const Writer) []const u8 {
+    fn slice(w: *const Writer) []const u8 {
         return w.buf[0..w.len];
     }
 };

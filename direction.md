@@ -245,7 +245,14 @@ in order of preference:
   this down from `<asm/hwcap.h>` rather than guessing.
 - Whether `/proc/self/exe` readlink is reliable enough across however this
   gets invoked (containers, chroots) or whether we need an `argv[0]` /
-  `AT_EXECFN` fallback too.
+  `AT_EXECFN` fallback too. — RESOLVED (step 4): the stub uses `AT_EXECFN`
+  from the auxv it already walks, and `execveat(fd, "", AT_EMPTY_PATH)` —
+  no /proc, no readlink, no argv[0] guessing at all.
+- Multicall payloads (busybox/coreutils style) dispatch on `argv[0]` — and
+  the stub passes the FAT binary's name through (verified live: coreutils
+  answered `unknown program 'fat'`). If such payloads matter, the config
+  needs a per-variant `argv[0]` override the stub substitutes at exec
+  time; ordinary payloads ignore argv[0] entirely.
 - How to encode CPUID conditions (leaf/subleaf/register/bit) into the
   existing `Condition` mask/expected pair — x86 needs a richer vocabulary
   than aarch64's hwcap mask.

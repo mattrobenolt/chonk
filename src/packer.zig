@@ -14,10 +14,17 @@
 
 const std = @import("std");
 const Io = std.Io;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const elf = std.elf;
+
 const format = @import("format.zig");
 
 /// Not a format rule — a refusal to concatenate something absurd.
 const max_file_size: u64 = 1 << 30;
+
+var stdout_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
+var stderr_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -25,7 +32,6 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     if (args.len != 4) {
-        var stderr_buffer: [1024]u8 = undefined;
         var stderr: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
         try stderr.interface.print("usage: {s} <stub> <payload> <output>\n", .{args[0]});
         try stderr.interface.flush();
@@ -47,7 +53,6 @@ pub fn main(init: std.process.Init) !void {
 
     const lay = try writeFat(io, cwd, args[3], stub, payload, stub_machine);
 
-    var stdout_buffer: [1024]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     try stdout.interface.print(
         "packed: payload @ {d} (size {d}), table @ {d}, total {d}\n",
@@ -81,7 +86,7 @@ pub fn layout(stub_len: u64, payload_len: u64) Layout {
 
 /// Read a whole file. Logs the path on failure — "error.FileNotFound" with
 /// no path is hostile from a CLI.
-fn readFile(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) ![]u8 {
+fn readFile(gpa: Allocator, io: Io, dir: Io.Dir, path: []const u8) ![]u8 {
     var file = dir.openFile(io, path, .{}) catch |err| {
         logFail(io, path, "open", err);
         return err;
@@ -97,9 +102,9 @@ fn readFile(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) ![]u8
 /// Validate ELF magic and extract `e_machine`. This is how the packer stays
 /// arch-blind while keeping species from mixing.
 fn elfMachine(io: Io, path: []const u8, bytes: []const u8) !u16 {
-    const machine_offset = @offsetOf(std.elf.Elf64_Ehdr, "e_machine");
+    const machine_offset = @offsetOf(elf.Elf64_Ehdr, "e_machine");
     if (bytes.len < machine_offset + @sizeOf(u16) or
-        !std.mem.eql(u8, bytes[0..4], std.elf.MAGIC))
+        !std.mem.eql(u8, bytes[0..4], elf.MAGIC))
     {
         logFail(io, path, "elf-check", error.NotAnElf);
         return error.NotAnElf;
@@ -108,7 +113,6 @@ fn elfMachine(io: Io, path: []const u8, bytes: []const u8) !u16 {
 }
 
 fn logFail(io: Io, path: []const u8, action: []const u8, err: anyerror) void {
-    var stderr_buffer: [1024]u8 = undefined;
     var stderr: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     stderr.interface.print(
         "packer: {s} {s}: {s}\n",
@@ -171,8 +175,6 @@ pub fn writeFat(
     return lay;
 }
 
-const testing = std.testing;
-
 test "v0 layout" {
     const lay = layout(100, 0x2000);
     try testing.expectEqual(@as(u64, 4096), lay.payload_offset);
@@ -194,9 +196,9 @@ test "elfMachine extracts e_machine and rejects non-ELF" {
     const io = testing.io;
     var stub: [64]u8 = @splat(0xAA);
     stub[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    const e_machine_offset = @offsetOf(std.elf.Elf64_Ehdr, "e_machine");
-    format.writeInt(u16, stub[e_machine_offset..][0..2], @intFromEnum(std.elf.EM.AARCH64));
-    try testing.expectEqual(@intFromEnum(std.elf.EM.AARCH64), try elfMachine(io, "stub", &stub));
+    const e_machine_offset = @offsetOf(elf.Elf64_Ehdr, "e_machine");
+    format.writeInt(u16, stub[e_machine_offset..][0..2], @intFromEnum(elf.EM.AARCH64));
+    try testing.expectEqual(@intFromEnum(elf.EM.AARCH64), try elfMachine(io, "stub", &stub));
 
     const not_elf = [_]u8{0} ** 64;
     try testing.expectError(error.NotAnElf, elfMachine(io, "payload", &not_elf));
@@ -208,13 +210,13 @@ test "writeFat round-trips through a real file" {
     defer tmp.cleanup();
 
     // Stand-in bytes, ELF-shaped where the packer looks: magic + e_machine.
-    const e_machine_offset = @offsetOf(std.elf.Elf64_Ehdr, "e_machine");
+    const e_machine_offset = @offsetOf(elf.Elf64_Ehdr, "e_machine");
     var stub: [100]u8 = @splat(0xAA);
     stub[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, stub[e_machine_offset..][0..2], @intFromEnum(std.elf.EM.AARCH64));
+    format.writeInt(u16, stub[e_machine_offset..][0..2], @intFromEnum(elf.EM.AARCH64));
     var payload: [300]u8 = @splat(0xBB);
     payload[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, payload[e_machine_offset..][0..2], @intFromEnum(std.elf.EM.AARCH64));
+    format.writeInt(u16, payload[e_machine_offset..][0..2], @intFromEnum(elf.EM.AARCH64));
 
     const machine = try elfMachine(io, "stub", &stub);
     const lay = try writeFat(io, tmp.dir, "fat.bin", &stub, &payload, machine);
@@ -231,7 +233,7 @@ test "writeFat round-trips through a real file" {
     const footer = try format.findFooter(fat);
     try testing.expectEqual(lay.table_offset, footer.table_offset);
     try testing.expectEqual(@as(u32, 1), footer.variant_count);
-    try testing.expectEqual(@intFromEnum(std.elf.EM.AARCH64), footer.machine);
+    try testing.expectEqual(@intFromEnum(elf.EM.AARCH64), footer.machine);
 
     // Entry decodes at table_offset and describes the payload.
     const entry = try format.decode(format.VariantEntry, fat[@intCast(footer.table_offset)..]);
