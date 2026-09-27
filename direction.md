@@ -149,21 +149,21 @@ Ordinary hosted tool — no freestanding constraints, write it in whatever's
 comfortable (Zig, Rust, even Python for a first draft since it's pure
 "read binaries + concatenate + emit struct bytes").
 
-Input: a config file, e.g.
+Input: a config file. **Decided (2026-09-27): ZON** — Zig-native, `std.zon.parse`
+exists in 0.16, no hand-rolled YAML subset parser to maintain. E.g.
 
-```yaml
-variants:
-  - name: neoverse-v2
-    binary: build/app-v2
-    match:
-      - { source: hwcap2, mask: "SVE2" }
-  - name: neoverse-v1
-    binary: build/app-v1
-    match:
-      - { source: hwcap, mask: "SVE" }
-  - name: generic
-    binary: build/app-generic
-    default: true
+```zig
+.{
+    .variants = .{
+        .{ .name = "neoverse-v2", .binary = "build/app-v2", .match = .{
+            .{ .source = "hwcap2", .mask = "SVE2" },
+        } },
+        .{ .name = "neoverse-v1", .binary = "build/app-v1", .match = .{
+            .{ .source = "hwcap", .mask = "SVE" },
+        } },
+        .{ .name = "generic", .binary = "build/app-generic", .default = true },
+    },
+}
 ```
 
 Packer responsibilities:
