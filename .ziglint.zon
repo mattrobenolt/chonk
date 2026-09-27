@@ -2,5 +2,7 @@
     .paths = .{ "src", "build.zig" },
     .rules = .{
         .Z024 = .{ .max_length = 100 },
+        // `_start` is the ELF/ABI-mandated entry symbol, not a naming slip.
+        .Z031 = .{ .enabled = false },
     },
 }

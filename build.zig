@@ -17,6 +17,30 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // The freestanding dispatcher. No libc — raw syscalls only, custom
+    // naked `_start` entry (src/stub.zig). Freestanding target is what keeps
+    // std.start out: on linux targets the compiler force-analyzes std.zig,
+    // which force-analyzes std.start, which demands a `main` and fights over
+    // the `_start` symbol. Freestanding skips all of that; std.os.linux
+    // wrappers still compile (arch-gated, not os-gated).
+    const stub = b.addExecutable(.{
+        .name = "stub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stub.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .aarch64,
+                .os_tag = .freestanding,
+            }),
+            .optimize = optimize,
+            .strip = optimize != .Debug,
+            .single_threaded = true,
+        }),
+    });
+
+    stub.entry = .enabled;
+
+    b.installArtifact(stub);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
