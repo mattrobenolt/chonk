@@ -14,51 +14,44 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mem = std.mem;
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
+const Allocator = mem.Allocator;
 const elf = std.elf;
 
 const format = @import("format.zig");
+const stdio = @import("stdio.zig");
 
 /// Not a format rule — a refusal to concatenate something absurd.
 const max_file_size: u64 = 1 << 30;
 
-var stdout_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
-var stderr_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
-
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const arena = init.arena.allocator();
-
-    const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 4) {
-        var stderr: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
-        try stderr.interface.print("usage: {s} <stub> <payload> <output>\n", .{args[0]});
-        try stderr.interface.flush();
-        return;
+/// `chonk pack <stub> <payload> <output>`. args = everything after the
+/// subcommand word. stdio is initialized by the front door (main.zig).
+pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !void {
+    if (args.len != 3) {
+        stdio.stderr.print("usage: chonk pack <stub> <payload> <output>\n", .{}) catch undefined;
+        return error.Usage;
     }
 
     const cwd = Io.Dir.cwd();
-    // One-shot CLI: reuse the args arena (process-lifetime, freed at exit) —
-    // no cleanup paths to get wrong, no leaks on error paths.
-    const stub = try readFile(arena, io, cwd, args[1]);
-    const payload = try readFile(arena, io, cwd, args[2]);
+    // One-shot subcommand: reuse the process arena (freed at exit) — no
+    // cleanup paths to get wrong, no leaks on error paths.
+    const stub = try readFile(io, arena, cwd, args[0]);
+    const payload = try readFile(io, arena, cwd, args[1]);
 
-    const stub_machine = try elfMachine(io, args[1], stub);
-    const payload_machine = try elfMachine(io, args[2], payload);
+    const stub_machine = try elfMachine(args[0], stub);
+    const payload_machine = try elfMachine(args[1], payload);
     if (stub_machine != payload_machine) {
-        logFail(io, args[2], "machine mismatch with stub", error.MachineMismatch);
+        logFail(args[1], "machine mismatch with stub", error.MachineMismatch);
         return error.MachineMismatch;
     }
 
-    const lay = try writeFat(io, cwd, args[3], stub, payload, stub_machine);
+    const lay = try writeFat(io, cwd, args[2], stub, payload, stub_machine);
 
-    var stdout: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    try stdout.interface.print(
+    stdio.stdout.print(
         "packed: payload @ {d} (size {d}), table @ {d}, total {d}\n",
         .{ lay.payload_offset, payload.len, lay.table_offset, lay.size },
-    );
-    try stdout.interface.flush();
+    ) catch undefined;
 }
 
 /// Fat-binary offsets for v0. Pure math — testable without touching a file.
@@ -74,7 +67,7 @@ pub const Layout = struct {
 };
 
 pub fn layout(stub_len: u64, payload_len: u64) Layout {
-    const payload_offset = std.mem.alignForward(u64, stub_len, format.page_size);
+    const payload_offset = mem.alignForward(u64, stub_len, format.page_size);
     const table_offset = payload_offset + payload_len;
     return .{
         .payload_offset = payload_offset,
@@ -86,39 +79,37 @@ pub fn layout(stub_len: u64, payload_len: u64) Layout {
 
 /// Read a whole file. Logs the path on failure — "error.FileNotFound" with
 /// no path is hostile from a CLI.
-fn readFile(gpa: Allocator, io: Io, dir: Io.Dir, path: []const u8) ![]u8 {
+fn readFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8) ![]u8 {
     var file = dir.openFile(io, path, .{}) catch |err| {
-        logFail(io, path, "open", err);
+        logFail(path, "open", err);
         return err;
     };
     defer file.close(io);
     var file_reader = file.reader(io, &.{});
     return file_reader.interface.allocRemaining(gpa, .limited(max_file_size)) catch |err| {
-        logFail(io, path, "read", err);
+        logFail(path, "read", err);
         return err;
     };
 }
 
 /// Validate ELF magic and extract `e_machine`. This is how the packer stays
 /// arch-blind while keeping species from mixing.
-fn elfMachine(io: Io, path: []const u8, bytes: []const u8) !u16 {
+fn elfMachine(path: []const u8, bytes: []const u8) !u16 {
     const machine_offset = @offsetOf(elf.Elf64_Ehdr, "e_machine");
     if (bytes.len < machine_offset + @sizeOf(u16) or
-        !std.mem.eql(u8, bytes[0..4], elf.MAGIC))
+        !mem.eql(u8, bytes[0..4], elf.MAGIC))
     {
-        logFail(io, path, "elf-check", error.NotAnElf);
+        logFail(path, "elf-check", error.NotAnElf);
         return error.NotAnElf;
     }
     return format.readInt(u16, bytes[machine_offset..][0..2]);
 }
 
-fn logFail(io: Io, path: []const u8, action: []const u8, err: anyerror) void {
-    var stderr: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
-    stderr.interface.print(
+fn logFail(path: []const u8, action: []const u8, err: anyerror) void {
+    stdio.stderr.print(
         "packer: {s} {s}: {s}\n",
         .{ action, path, @errorName(err) },
     ) catch return;
-    stderr.interface.flush() catch return;
 }
 
 /// Concatenate and write the fat binary. Creates the output with mode 0755
@@ -152,7 +143,7 @@ pub fn writeFat(
     var out_file = dir.createFile(io, out_path, .{
         .permissions = .fromMode(0o755),
     }) catch |err| {
-        logFail(io, out_path, "create", err);
+        logFail(out_path, "create", err);
         return err;
     };
     defer out_file.close(io);
@@ -193,19 +184,21 @@ test "layout on exact page boundary needs no pad" {
 }
 
 test "elfMachine extracts e_machine and rejects non-ELF" {
-    const io = testing.io;
+    // logFail writes through stdio.stderr — undefined until stdio.init runs.
+    stdio.init(testing.io);
     var stub: [64]u8 = @splat(0xAA);
     stub[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
     const e_machine_offset = @offsetOf(elf.Elf64_Ehdr, "e_machine");
     format.writeInt(u16, stub[e_machine_offset..][0..2], @intFromEnum(elf.EM.AARCH64));
-    try testing.expectEqual(@intFromEnum(elf.EM.AARCH64), try elfMachine(io, "stub", &stub));
+    try testing.expectEqual(@intFromEnum(elf.EM.AARCH64), try elfMachine("stub", &stub));
 
     const not_elf = [_]u8{0} ** 64;
-    try testing.expectError(error.NotAnElf, elfMachine(io, "payload", &not_elf));
+    try testing.expectError(error.NotAnElf, elfMachine("payload", &not_elf));
 }
 
 test "writeFat round-trips through a real file" {
     const io = testing.io;
+    stdio.init(io);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -218,7 +211,7 @@ test "writeFat round-trips through a real file" {
     payload[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
     format.writeInt(u16, payload[e_machine_offset..][0..2], @intFromEnum(elf.EM.AARCH64));
 
-    const machine = try elfMachine(io, "stub", &stub);
+    const machine = try elfMachine("stub", &stub);
     const lay = try writeFat(io, tmp.dir, "fat.bin", &stub, &payload, machine);
     const stat = try tmp.dir.statFile(io, "fat.bin", .{});
     try testing.expectEqual(lay.size, stat.size);
@@ -227,7 +220,7 @@ test "writeFat round-trips through a real file" {
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const fat = try readFile(arena.allocator(), io, tmp.dir, "fat.bin");
+    const fat = try readFile(io, arena.allocator(), tmp.dir, "fat.bin");
 
     // The stub's discovery path: footer findable from EOF alone.
     const footer = try format.findFooter(fat);

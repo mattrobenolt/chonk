@@ -41,19 +41,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(stub);
 
-    // The hosted packer. Ordinary target — no freestanding constraints here.
-    const packer = b.addExecutable(.{
-        .name = "packer",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/packer.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
-        }),
-    });
-
-    b.installArtifact(packer);
-
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
