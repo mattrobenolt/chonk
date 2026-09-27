@@ -150,36 +150,44 @@ comfortable (Zig, Rust, even Python for a first draft since it's pure
 "read binaries + concatenate + emit struct bytes").
 
 Input: a config file. **Decided (2026-09-27): ZON** — Zig-native, `std.zon.parse`
-exists in 0.16, no hand-rolled YAML subset parser to maintain. E.g.
+exists in 0.16, no hand-rolled YAML subset parser to maintain. **Refined
+(step 5): a named bit implies its source** — the table knows SVE2 is hwcap2,
+so the config never says `source = "hwcap2"` and the mismatch-error class
+cannot exist. Binary paths are relative to the config file's own directory.
 
 ```zig
 .{
     .variants = .{
         .{ .name = "neoverse-v2", .binary = "build/app-v2", .match = .{
-            .{ .source = "hwcap2", .mask = "SVE2" },
+            .{ .bit = "SVE2" },
         } },
         .{ .name = "neoverse-v1", .binary = "build/app-v1", .match = .{
-            .{ .source = "hwcap", .mask = "SVE" },
+            .{ .bit = "SVE" },
         } },
+        // Raw form for anything the table doesn't name:
+        //   .{ .source = "hwcap", .mask = 0x400000, .expected = 0x400000 }
         .{ .name = "generic", .binary = "build/app-generic", .default = true },
     },
 }
 ```
 
-Packer responsibilities:
+Packer responsibilities (shipped as `chonk pack <stub> <config.zon> <output>`):
 
-1. Parse YAML, resolve named bit constants (`SVE`, `SVE2`, ...) to actual
-   HWCAP/HWCAP2 bit values — keep a small lookup table in the packer so the
-   config stays human-readable instead of raw hex masks.
-2. Validate: exactly one `default: true`, all `binary:` paths exist, no
-   duplicate variant names.
-3. Read `stub` binary bytes; validate stub + payload ELF `e_machine` agree
-   and stamp it into the footer (the arch-blind species check).
+1. Parse ZON, resolve named bit constants (`SVE`, `SVE2`, ...) via the
+   packer's bit table (pinned from the kernel UAPI header) so the config
+   stays human-readable instead of raw hex masks. A name implies its source.
+2. Validate: at least one variant, exactly one `default = true`, no duplicate
+   names, every match is well-formed (bit XOR raw, nonzero mask, known
+   source).
+3. Read `stub` + payload bytes; validate every ELF: magic, `e_machine` must
+   agree across stub + all payloads (stamped into the footer), and each
+   payload must be a program — `e_type ∈ {EXEC, DYN}` with a nonzero entry
+   (a dlopen-style library execves then dies; verified live on libm.so.6).
 4. For each variant, page-align the running offset, read payload bytes,
    record `(offset, size)`.
 5. Emit condition blob + variant table + footer per the shared struct
-   layout (§3) — same byte layout the stub expects, ideally generated from
-   one shared struct definition (see §6) so the two never drift.
+   layout (§3) — generated from the one shared format.zig so the two never
+   drift.
 6. Concatenate everything to the output file, `chmod +x`.
 
 Nice-to-have once the basic path works: `packer inspect <binary>` — parse an

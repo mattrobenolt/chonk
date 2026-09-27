@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
 fn usageExit() u8 {
     const usage =
         \\ usage: chonk <command> [args]
-        \\   chonk pack <stub> <payload> <output>   pack a fat binary
+        \\   chonk pack <stub> <config.zon> <output>  pack a fat binary from a config
         \\   chonk inspect <binary>                 print a fat binary's variant table
     ;
     stdio.writeAll(.err, usage ++ "\n");
