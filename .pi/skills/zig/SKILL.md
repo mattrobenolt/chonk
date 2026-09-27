@@ -5,7 +5,7 @@ description: "Write correct, idiomatic Zig 0.16 code in this repository (pins zi
 
 # Zig 0.16 (this repo)
 
-This repo builds with zig 0.16.0 (nix flake, `zig_0_16`). Training data covers 0.11-0.15 at best. The 0.15-era patterns (the global `zig` skill) are **wrong here** in specific, silent ways — mostly around `std.Io`, `std.posix`, and `main`'s signature.
+This repo builds with zig 0.16.0 (nix flake, `zig_0_16`). The project is `chonk`: an aarch64 fat-binary dispatcher — freestanding `stub` (auxv walk → condition match → memfd+execve into an embedded page-aligned payload) + hosted `packer` (config + variant binaries → concatenated output). `direction.md` is the directional spec; `src/format.zig` is the shared wire contract (single source of truth, direction.md §6). Training data covers 0.11-0.15 at best. The 0.15-era patterns (the global `zig` skill) are **wrong here** in specific, silent ways — mostly around `std.Io`, `std.posix`, and `main`'s signature.
 
 Rule zero: verify APIs against the pinned toolchain, not memory.
 
@@ -63,7 +63,7 @@ var reader: std.Io.Reader = .fixed(data);
 
 - Functions that do I/O take `Io` (by value) or `*Io`. If you have no `Io` at hand: `var threaded: std.Io.Threaded = .init_single_threaded; const io = threaded.io();` — a workaround, not a pattern; thread `Io` through instead.
 - `std.net` → `std.Io.net` (IpAddress, listen, bind, and `UnixAddress` for UDS — `io.vtable.netListenUnix` / `netConnectUnix` exist in the interface; verify backend support before relying on them).
-- Io implementations: `Io.Threaded` is complete (default for `init.io`). `Io.Evented`/`Io.Uring`/`Io.Kqueue` are WIP/proof-of-concept (Evented lacks networking). This project's event loop does not use them — see [references/linux-raw-layer.md](references/linux-raw-layer.md).
+- Io implementations: `Io.Threaded` is complete (default for `init.io`). `Io.Evented`/`Io.Uring`/`Io.Kqueue` are WIP/proof-of-concept (Evented lacks networking). Neither chonk nor ztls uses them. `references/` files were written for ztls; the recipes remain valid — ignore ztls-specific inventory.
 
 ### 3. `std.posix` was gutted — 54 functions left
 
@@ -88,7 +88,7 @@ pub fn setsockopt(fd: i32, level: i32, optname: u32, opt: []const u8) bool {
 const rc = linux.syscall6(.splice, fd_in, @intFromPtr(off_in_opt), fd_out, @intFromPtr(off_out_opt), len, flags);
 ```
 
-**kTLS is not in handoff** — the modes left at `8238965`, and the verified UAPI layer lives in ztls core (`ztls.ktls`) if it is ever needed again. Do not define kernel TLS constants in this repo.
+**aarch64 hwcap/dispatch facts (verified here 2026-09-27):** `std.elf` has `AT_HWCAP = 16` / `AT_HWCAP2 = 26`, but aarch64 named hwcap bits are NOT in std (`os/linux/arm.zig` is 32-bit ARM only) — the packer carries its own name→bit table. Kernel UAPI (`arch/arm64/include/uapi/asm/hwcap.h`): `HWCAP_SVE = 1<<22`, `HWCAP2_SVE2 = 1<<1`. The raw layer covers the stub end to end: `pread`, `memfd_create`, `execve`/`execveat`, `readlink`, `sendfile` are all in `std.os.linux`. Host `launchpad` is a Neoverse V2 (CPU part `0xd84`, `AT_HWCAP2 = 0x801bf3bf` — SVE2 family live; HWCAP_CPUID set so MIDR_EL1 is readable at EL0 here). V1 testing needs QEMU or other hardware.
 
 `std.os.linux.IoUring` is the raw ring wrapper (init, get_sqe, submit, enter, copy_cqes, cqe_seen, plus op builders: `splice`, `read_fixed`, `write_fixed`, `accept`, ...). Use that, **not** `std.Io.Uring` (the WIP Evented backend).
 
@@ -133,7 +133,7 @@ const len = r.assumeRead(u16);           // attacker-controlled TLS record lengt
 if (remaining < len + 5) return error.UnexpectedEof;   // BUG: len + 5 overflows u16
 ```
 
-panics (Debug/ReleaseSafe) or is UB (ReleaseFast) before the comparison rejects the oversized input. Remote DoS class — caused 14 exploitable sites in ztls (#72). `ziglint` does not catch this. This project parses TLS record headers (u16 lengths) constantly. Always widen first:
+panics (Debug/ReleaseSafe) or is UB (ReleaseFast) before the comparison rejects the oversized input. Remote DoS class — caused 14 exploitable sites in ztls (#72). `ziglint` does not catch this. The origin is TLS record parsing (ztls #72); chonk has the same class in trailer parsing (u32 condition counts, u64 offsets — widen against `usize` file lengths before any use). Always widen first:
 
 ```zig
 if (remaining < @as(usize, len) + 5) return error.UnexpectedEof;
