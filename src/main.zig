@@ -4,11 +4,17 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const stringToEnum = std.meta.stringToEnum;
 
+const pack = @import("pack.zig");
 const stdio = @import("stdio.zig");
-const packer = @import("packer.zig");
 
-pub fn main(init: std.process.Init) !void {
+const Cmd = enum {
+    pack,
+    inspect,
+};
+
+pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
 
@@ -16,42 +22,39 @@ pub fn main(init: std.process.Init) !void {
     defer stdio.flush();
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 2) usageExit();
+    if (args.len < 2) return usageExit();
 
     const cmd = args[1];
     const rest = args[2..];
 
-    if (std.mem.eql(u8, cmd, "pack")) {
-        packer.run(io, arena, rest) catch |err| {
-            stdio.flush();
-            std.process.exit(if (err == error.Usage) 2 else 1);
-        };
-        return;
+    switch (stringToEnum(Cmd, cmd) orelse {
+        stdio.print(.err, "chonk: unknown command '{s}'", .{cmd});
+        return usageExit();
+    }) {
+        .pack => {
+            return pack.run(io, arena, rest) catch |err| {
+                return if (err == error.Usage) 2 else 1;
+            };
+        },
+        .inspect => {
+            stdio.writeAll(.err, "chonk: inspect: not implemented yet\n");
+            return 2;
+        },
     }
-    if (std.mem.eql(u8, cmd, "inspect")) {
-        stdio.stderr.print("chonk: inspect: not implemented yet\n", .{}) catch undefined;
-        stdio.flush();
-        std.process.exit(2);
-    }
-
-    stdio.stderr.print("chonk: unknown command '{s}'\n", .{cmd}) catch undefined;
-    usageExit();
 }
 
-/// Print top-level usage and exit 2 — every direct `process.exit` path
-/// flushes stdio by hand first, or buffered output would vanish.
-fn usageExit() noreturn {
-    stdio.stderr.print(
-        "usage: chonk <command> [args]\n" ++
-            "  chonk pack <stub> <payload> <output>   pack a fat binary\n" ++
-            "  chonk inspect <binary>                print a fat binary's variant table\n",
-        .{},
-    ) catch undefined;
-    stdio.flush();
-    std.process.exit(2);
+/// Print top-level usage and return exit code 2. Returning through main
+/// runs its `defer stdio.flush()` — no direct `process.exit` remains.
+fn usageExit() u8 {
+    const usage =
+        \\ usage: chonk <command> [args]
+        \\   chonk pack <stub> <payload> <output>   pack a fat binary
+        \\   chonk inspect <binary>                 print a fat binary's variant table
+    ;
+    stdio.writeAll(.err, usage ++ "\n");
+    return 2;
 }
 
 test {
-    _ = @import("format.zig");
-    _ = @import("packer.zig");
+    std.testing.refAllDecls(@This());
 }

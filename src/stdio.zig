@@ -32,6 +32,28 @@ pub fn init(io: Io) void {
     stdout = &stdout_writer.interface;
 }
 
+pub const Where = enum {
+    err,
+    out,
+
+    fn writer(w: Where) *Io.Writer {
+        return switch (w) {
+            .err => stderr,
+            .out => stdout,
+        };
+    }
+};
+
+pub fn print(comptime w: Where, comptime fmt: []const u8, args: anytype) void {
+    var f = w.writer();
+    f.print(fmt ++ "\n", args) catch return;
+}
+
+pub fn writeAll(comptime w: Where, bytes: []const u8) void {
+    var f = w.writer();
+    f.writeAll(bytes) catch return;
+}
+
 /// Flush both streams. Main's exit defer calls this; direct
 /// `std.process.exit` callers must call it by hand first.
 pub fn flush() void {

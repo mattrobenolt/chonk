@@ -27,9 +27,9 @@ const max_file_size: u64 = 1 << 30;
 
 /// `chonk pack <stub> <payload> <output>`. args = everything after the
 /// subcommand word. stdio is initialized by the front door (main.zig).
-pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !void {
+pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     if (args.len != 3) {
-        stdio.stderr.print("usage: chonk pack <stub> <payload> <output>\n", .{}) catch undefined;
+        stdio.writeAll(.err, "usage: chonk pack <stub> <payload> <output>\n");
         return error.Usage;
     }
 
@@ -48,10 +48,12 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !void {
 
     const lay = try writeFat(io, cwd, args[2], stub, payload, stub_machine);
 
-    stdio.stdout.print(
-        "packed: payload @ {d} (size {d}), table @ {d}, total {d}\n",
+    stdio.print(
+        .out,
+        "packed: payload @ {d} (size {d}), table @ {d}, total {d}",
         .{ lay.payload_offset, payload.len, lay.table_offset, lay.size },
-    ) catch undefined;
+    );
+    return 0;
 }
 
 /// Fat-binary offsets for v0. Pure math — testable without touching a file.
@@ -79,6 +81,7 @@ pub fn layout(stub_len: u64, payload_len: u64) Layout {
 
 /// Read a whole file. Logs the path on failure — "error.FileNotFound" with
 /// no path is hostile from a CLI.
+/// TODO: this should not read the entire file into memory, we should stream it!
 fn readFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8) ![]u8 {
     var file = dir.openFile(io, path, .{}) catch |err| {
         logFail(path, "open", err);
@@ -106,10 +109,7 @@ fn elfMachine(path: []const u8, bytes: []const u8) !u16 {
 }
 
 fn logFail(path: []const u8, action: []const u8, err: anyerror) void {
-    stdio.stderr.print(
-        "packer: {s} {s}: {s}\n",
-        .{ action, path, @errorName(err) },
-    ) catch return;
+    stdio.print(.err, "pack: {s} {s}: {s}", .{ action, path, @errorName(err) });
 }
 
 /// Concatenate and write the fat binary. Creates the output with mode 0755
