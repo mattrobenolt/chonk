@@ -97,11 +97,10 @@ pub fn encode(comptime T: type, value: T) [@sizeOf(T)]u8 {
         switch (@typeInfo(field.type)) {
             .int => |info| {
                 const byte_count = @divExact(info.bits, 8);
-                std.mem.writeInt(
+                writeInt(
                     field.type,
                     out[offset .. offset + byte_count],
                     @field(value, field.name),
-                    .little,
                 );
             },
             .@"enum" => out[offset] = @intFromEnum(@field(value, field.name)),
@@ -124,10 +123,9 @@ pub fn decode(comptime T: type, bytes: []const u8) Error!T {
         switch (@typeInfo(field.type)) {
             .int => |info| {
                 const byte_count = @divExact(info.bits, 8);
-                @field(result, field.name) = std.mem.readInt(
+                @field(result, field.name) = readInt(
                     field.type,
                     bytes[offset .. offset + byte_count],
-                    .little,
                 );
             },
             .@"enum" => @field(result, field.name) = try enumFromByte(field.type, bytes[offset]),
@@ -147,6 +145,18 @@ fn enumFromByte(comptime E: type, raw: u8) Error!E {
     return error.InvalidSource;
 }
 
+pub inline fn readInt(comptime T: type, buffer: *const [@divExact(@typeInfo(T).int.bits, 8)]u8) T {
+    return std.mem.readInt(T, buffer, .little);
+}
+
+pub inline fn writeInt(
+    comptime T: type,
+    buffer: *[@divExact(@typeInfo(T).int.bits, 8)]u8,
+    value: T,
+) void {
+    std.mem.writeInt(T, buffer, value, .little);
+}
+
 /// Locate and decode the footer at the end of `file`.
 pub fn findFooter(file: []const u8) Error!Footer {
     if (file.len < @sizeOf(Footer)) return error.Truncated;
@@ -158,7 +168,7 @@ pub fn findFooter(file: []const u8) Error!Footer {
 
 test "magic is CHONKv01 little-endian" {
     const magic_bytes = [_]u8{ 'C', 'H', 'O', 'N', 'K', 'v', '0', '1' };
-    try testing.expectEqual(magic, std.mem.readInt(u64, &magic_bytes, .little));
+    try testing.expectEqual(magic, readInt(u64, &magic_bytes));
 }
 
 test "footer encode pins little-endian byte layout" {
