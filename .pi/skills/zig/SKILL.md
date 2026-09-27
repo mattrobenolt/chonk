@@ -90,6 +90,19 @@ const rc = linux.syscall6(.splice, fd_in, @intFromPtr(off_in_opt), fd_out, @intF
 
 **aarch64 hwcap/dispatch facts (verified here 2026-09-27):** `std.elf` has `AT_HWCAP = 16` / `AT_HWCAP2 = 26`, but aarch64 named hwcap bits are NOT in std (`os/linux/arm.zig` is 32-bit ARM only) — the packer carries its own name→bit table. Kernel UAPI (`arch/arm64/include/uapi/asm/hwcap.h`): `HWCAP_SVE = 1<<22`, `HWCAP2_SVE2 = 1<<1`. The raw layer covers the stub end to end: `pread`, `memfd_create`, `execve`/`execveat`, `readlink`, `sendfile` are all in `std.os.linux`. Host `launchpad` is a Neoverse V2 (CPU part `0xd84`, `AT_HWCAP2 = 0x801bf3bf` — SVE2 family live; HWCAP_CPUID set so MIDR_EL1 is readable at EL0 here). V1 testing needs QEMU or other hardware.
 
+**Custom naked entry (`export fn _start`) on a linux target — blocked; use
+freestanding:** for every non-freestanding exe the compiler force-analyzes
+`std.zig`, whose `comptime { _ = start; }` force-analyzes `std.start`, which
+demands `root.main` and exports its own `_start` (colliding with yours).
+No entry flag fixes it — not `-fentry=_start`, not `-fno-entry`. Fix (verified):
+target `.{ .cpu_arch = .aarch64, .os_tag = .freestanding }` + `exe.entry =
+.enabled`; `std.os.linux` syscall wrappers still compile (`os.zig` imports
+`os/linux.zig` unconditionally — arch-gated, not os-gated). Entry asm pattern
+(copied from std.start, verified): zero fp/lr, `mov x0, sp` (the ORIGINAL sp),
+realign `and sp, x0, #-16`, tail-branch `b %[fn]` with operands
+`[fn] "X" (&fn)` plus self-reference `[_start] "X" (&_start)` to force
+emission. readelf confirms: EXEC (not PIE), no PT_INTERP, entry = our _start.
+
 `std.os.linux.IoUring` is the raw ring wrapper (init, get_sqe, submit, enter, copy_cqes, cqe_seen, plus op builders: `splice`, `read_fixed`, `write_fixed`, `accept`, ...). Use that, **not** `std.Io.Uring` (the WIP Evented backend).
 
 Full inventory and recipes: [references/linux-raw-layer.md](references/linux-raw-layer.md).
