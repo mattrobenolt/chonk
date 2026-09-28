@@ -320,9 +320,13 @@ in order of preference:
   no /proc, no readlink, no argv[0] guessing at all.
 - Multicall payloads (busybox/coreutils style) dispatch on `argv[0]` — and
   the stub passes the FAT binary's name through (verified live: coreutils
-  answered `unknown program 'fat'`). If such payloads matter, the config
-  needs a per-variant `argv[0]` override the stub substitutes at exec
-  time; ordinary payloads ignore argv[0] entirely.
+  answered `unknown program 'fat'`). **Decided (2026-09-28): not
+  supported.** No `argv[0]` override will exist — multicall payloads are
+  out of scope. Chonk dispatches the same program compiled for different
+  CPUs; it does not support shipping discretely different binaries as
+  variants. The wire cannot tell, so nothing enforces it — but it is not a
+  supported shape, and test configs that use distinct binaries as
+  observably-distinct tracers are test technique, not product direction.
 - How to encode CPUID conditions into the existing `Condition` — RESOLVED
   (step 8): `source = cpuid` with `mask` transporting
   `(leaf << 32) | subleaf` and `expected` transporting
