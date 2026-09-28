@@ -191,7 +191,9 @@ factory:
 
     fn postProcess(b: *Build, v: chonk.Variant, payload: Build.LazyPath) Build.LazyPath {
         // The baseline packs a copied bash (the recipe copies it in as
-        // `tracer` before zig build); other variants pass through.
+        // "tracer" before zig build); other variants pass through. No
+        // backticks in heredoc content: unquoted heredocs run shell
+        // substitution on the content.
         if (std.mem.eql(u8, v.name, "generic")) return b.path("tracer");
         return payload;
     }
