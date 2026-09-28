@@ -47,9 +47,11 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
         .install = false, // wired into the chonk step below, not the default
         .targets = &.{
-            .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
+            .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
+            .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_n1 } },
             // no fallback listed — the arch baseline is appended
-            // automatically as the last entry
+            // automatically as the last entry. n1 exercises the base-word
+            // inference (aes/sha2/crc32/atomics/dotprod — no SVE at all).
         },
     });
     const install_arm = b.addInstallFileWithDir(fat_arm, .bin, "app");
@@ -64,7 +66,7 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
         .install = false,
         .targets = &.{
-            .{ .explicit = &Target.x86.cpu.x86_64_v3 },
+            .{ .model = .{ .explicit = &Target.x86.cpu.x86_64_v3 } },
             // no fallback listed — the arch baseline is appended
             // automatically as the last entry
         },

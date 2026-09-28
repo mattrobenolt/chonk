@@ -89,12 +89,13 @@ fn machineName(machine: u16) []const u8 {
 fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
     switch (condition.source) {
         .hwcap, .hwcap2 => {
-            inline for (comptime std.enums.values(pack.Bit)) |bit| {
-                const s = bit.spec();
-                if (s.source == condition.source and s.mask == condition.mask and
-                    condition.expected == s.mask)
+            // The same table inference reads — display is the reverse
+            // direction of the same vocabulary.
+            inline for (pack.aarch64_table) |e| {
+                if (e.source == condition.source and e.mask == condition.mask and
+                    condition.expected == e.mask)
                 {
-                    return @tagName(bit);
+                    return @tagName(e.bit);
                 }
             }
             return std.fmt.allocPrint(
@@ -108,12 +109,13 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
             const subleaf: u32 = @truncate(condition.mask);
             const reg: u8 = @truncate(condition.expected >> 5);
             const bit: u5 = @truncate(condition.expected);
-            inline for (comptime std.enums.values(CpuidName)) |name| {
-                const c = name.spec();
-                if (c.leaf == leaf and c.subleaf == subleaf and
-                    @intFromEnum(c.register) == reg and c.bit == bit)
+            // The same table inference reads — display names are the Zig
+            // feature names the table is keyed by.
+            inline for (pack.x86_table) |e| {
+                if (e.cpuid.leaf == leaf and e.cpuid.subleaf == subleaf and
+                    @intFromEnum(e.cpuid.register) == reg and e.cpuid.bit == bit)
                 {
-                    return name.label();
+                    return @tagName(e.feature);
                 }
             }
             const reg_name = switch (reg) {
@@ -133,68 +135,13 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
     }
 }
 
-/// The x86_64 CPUID vocabulary, display-side mirror of build.zig's
-/// inference table: psABI-level features keyed by location. Display-only —
-/// an unknown location prints raw, never lies.
-const CpuidName = enum {
-    ssse3,
-    cx16,
-    sse4_1,
-    sse4_2,
-    fma,
-    movbe,
-    popcnt,
-    aes,
-    avx,
-    f16c,
-    bmi,
-    avx2,
-    bmi2,
-    avx512f,
-    avx512dq,
-    avx512cd,
-    avx512bw,
-    avx512vl,
-    sahf,
-    lzcnt,
-
-    fn label(name: CpuidName) []const u8 {
-        return @tagName(name);
-    }
-
-    fn spec(name: CpuidName) pack.Cpuid {
-        return switch (name) {
-            .ssse3 => .{ .leaf = 1, .register = .ecx, .bit = 9 },
-            .cx16 => .{ .leaf = 1, .register = .ecx, .bit = 13 },
-            .sse4_1 => .{ .leaf = 1, .register = .ecx, .bit = 19 },
-            .sse4_2 => .{ .leaf = 1, .register = .ecx, .bit = 20 },
-            .fma => .{ .leaf = 1, .register = .ecx, .bit = 12 },
-            .movbe => .{ .leaf = 1, .register = .ecx, .bit = 22 },
-            .popcnt => .{ .leaf = 1, .register = .ecx, .bit = 23 },
-            .aes => .{ .leaf = 1, .register = .ecx, .bit = 25 },
-            .avx => .{ .leaf = 1, .register = .ecx, .bit = 28 },
-            .f16c => .{ .leaf = 1, .register = .ecx, .bit = 29 },
-            .bmi => .{ .leaf = 7, .register = .ebx, .bit = 3 },
-            .avx2 => .{ .leaf = 7, .register = .ebx, .bit = 5 },
-            .bmi2 => .{ .leaf = 7, .register = .ebx, .bit = 8 },
-            .avx512f => .{ .leaf = 7, .register = .ebx, .bit = 16 },
-            .avx512dq => .{ .leaf = 7, .register = .ebx, .bit = 17 },
-            .avx512cd => .{ .leaf = 7, .register = .ebx, .bit = 28 },
-            .avx512bw => .{ .leaf = 7, .register = .ebx, .bit = 30 },
-            .avx512vl => .{ .leaf = 7, .register = .ebx, .bit = 31 },
-            .sahf => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 0 },
-            .lzcnt => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 5 },
-        };
-    }
-};
-
 test "describeCondition names known values, raw otherwise" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     // A named aarch64 bit: sve2's own spec.
-    const s = pack.Bit.sve2.spec();
+    const s = pack.spec(.sve2);
     try testing.expectEqualStrings(
         "sve2",
         describeCondition(arena, .{

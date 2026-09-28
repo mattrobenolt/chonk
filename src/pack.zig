@@ -80,6 +80,51 @@ pub const Cpuid = struct {
     pub const Register = enum(u8) { eax, ebx, ecx, edx };
 };
 
+/// One x86_64 vocabulary entry: the Zig target feature and the CPUID
+/// location that advertises it. The CPUID locations are hand-pinned from
+/// the x86-64 psABI / Intel SDM — Zig carries no CPUID table, so comptime
+/// cannot derive them. What comptime DOES enforce: every feature appears
+/// exactly once, so inference (build) and display (inspect) read one table.
+pub const X86Entry = struct {
+    feature: std.Target.x86.Feature,
+    cpuid: Cpuid,
+};
+
+/// The one x86_64 table: the psABI-level-defining set (x86-64 v2/v3/v4).
+pub const x86_table = [_]X86Entry{
+    // CPUID.1H:ECX
+    .{ .feature = .ssse3, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 9 } },
+    .{ .feature = .cx16, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 13 } },
+    .{ .feature = .sse4_1, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 19 } },
+    .{ .feature = .sse4_2, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 20 } },
+    .{ .feature = .fma, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 12 } },
+    .{ .feature = .movbe, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 22 } },
+    .{ .feature = .popcnt, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 23 } },
+    .{ .feature = .aes, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 25 } },
+    .{ .feature = .avx, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 28 } },
+    .{ .feature = .f16c, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 29 } },
+    // CPUID.7H.0H:EBX
+    .{ .feature = .bmi, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 3 } },
+    .{ .feature = .avx2, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } },
+    .{ .feature = .bmi2, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 8 } },
+    .{ .feature = .avx512f, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 16 } },
+    .{ .feature = .avx512dq, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 17 } },
+    .{ .feature = .avx512cd, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 28 } },
+    .{ .feature = .avx512bw, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 30 } },
+    .{ .feature = .avx512vl, .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 31 } },
+    // CPUID.80000001H:ECX
+    .{ .feature = .sahf, .cpuid = .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 0 } },
+    .{ .feature = .lzcnt, .cpuid = .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 5 } },
+};
+
+comptime {
+    for (x86_table, 0..) |a, i| {
+        for (x86_table[i + 1 ..]) |b| {
+            std.debug.assert(a.feature != b.feature);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bit vocabulary — the only place chonk knows what "sve2" means.
 // ---------------------------------------------------------------------------
@@ -88,7 +133,28 @@ pub const Cpuid = struct {
 /// arch/arm64/include/uapi/asm/hwcap.h (torvalds master, 2026-09-27). A
 /// name implies its source — that is the whole reason named bits exist:
 /// the config never says "hwcap2", the enum does.
+/// The aarch64 vocabulary enum — one tag per kernel hwcap bit chonk
+/// knows. The wire positions and Zig feature mappings live in
+/// `aarch64_table`, one entry per tag, checked at comptime.
 pub const Bit = enum {
+    // The base HWCAP word (#2): the pre-SVE tiers.
+    asimd,
+    aes,
+    pmull,
+    sha1,
+    sha2,
+    crc32,
+    atomics,
+    asimdrdm,
+    fcma,
+    dcpop,
+    sha3,
+    sm3,
+    sm4,
+    asimddp,
+    sha512,
+
+    // The SVE era: the HWCAP2 word plus SVE itself.
     sve,
     sve2,
     sveaes,
@@ -101,25 +167,82 @@ pub const Bit = enum {
     i8mm,
     bf16,
     sme,
-
-    /// The wire form: which source word, which bit.
-    pub fn spec(bit: Bit) struct { source: format.Source, mask: u64 } {
-        return switch (bit) {
-            .sve => .{ .source = .hwcap, .mask = 1 << 22 },
-            .sve2 => .{ .source = .hwcap2, .mask = 1 << 1 },
-            .sveaes => .{ .source = .hwcap2, .mask = 1 << 2 },
-            .svepmull => .{ .source = .hwcap2, .mask = 1 << 3 },
-            .svebitperm => .{ .source = .hwcap2, .mask = 1 << 4 },
-            .svesha3 => .{ .source = .hwcap2, .mask = 1 << 5 },
-            .svesm4 => .{ .source = .hwcap2, .mask = 1 << 6 },
-            .svei8mm => .{ .source = .hwcap2, .mask = 1 << 9 },
-            .svebf16 => .{ .source = .hwcap2, .mask = 1 << 12 },
-            .i8mm => .{ .source = .hwcap2, .mask = 1 << 13 },
-            .bf16 => .{ .source = .hwcap2, .mask = 1 << 14 },
-            .sme => .{ .source = .hwcap2, .mask = 1 << 23 },
-        };
-    }
 };
+
+/// One aarch64 vocabulary entry: the kernel wire form AND the Zig target
+/// feature that implies it, where Zig has one. The kernel bit positions are
+/// hand-pinned from arch/arm64/include/uapi/asm/hwcap.h (torvalds master,
+/// 2026-09-27) — Zig carries no kernel hwcap table, so comptime cannot
+/// derive them. What comptime DOES enforce: every Bit tag has exactly one
+/// entry here, so `spec`, inference, and display all read one table and
+/// cannot drift apart.
+pub const Aarch64Entry = struct {
+    bit: Bit,
+    source: format.Source,
+    mask: u64,
+    /// The Zig aarch64 feature that implies the bit. Null = explicit-only
+    /// (Zig has no target feature for pmull, sha1, fcma, dcpop, sm3,
+    /// sha512, svepmull, svei8mm, svebf16). `asimd` is in the arch
+    /// baseline, so it never distinguishes anything in inference.
+    feature: ?std.Target.aarch64.Feature,
+};
+
+/// The one aarch64 table: kernel wire positions from the UAPI header,
+/// Zig feature names verified against std.Target.aarch64.
+pub const aarch64_table = [_]Aarch64Entry{
+    .{ .bit = .asimd, .source = .hwcap, .mask = 1 << 1, .feature = .neon },
+    .{ .bit = .aes, .source = .hwcap, .mask = 1 << 3, .feature = .aes },
+    .{ .bit = .pmull, .source = .hwcap, .mask = 1 << 4, .feature = null },
+    .{ .bit = .sha1, .source = .hwcap, .mask = 1 << 5, .feature = null },
+    .{ .bit = .sha2, .source = .hwcap, .mask = 1 << 6, .feature = .sha2 },
+    .{ .bit = .crc32, .source = .hwcap, .mask = 1 << 7, .feature = .crc },
+    .{ .bit = .atomics, .source = .hwcap, .mask = 1 << 8, .feature = .lse },
+    .{ .bit = .asimdrdm, .source = .hwcap, .mask = 1 << 12, .feature = .rdm },
+    .{ .bit = .fcma, .source = .hwcap, .mask = 1 << 14, .feature = null },
+    .{ .bit = .dcpop, .source = .hwcap, .mask = 1 << 16, .feature = null },
+    .{ .bit = .sha3, .source = .hwcap, .mask = 1 << 17, .feature = .sha3 },
+    .{ .bit = .sm3, .source = .hwcap, .mask = 1 << 18, .feature = null },
+    .{ .bit = .sm4, .source = .hwcap, .mask = 1 << 19, .feature = .sm4 },
+    .{ .bit = .asimddp, .source = .hwcap, .mask = 1 << 20, .feature = .dotprod },
+    .{ .bit = .sha512, .source = .hwcap, .mask = 1 << 21, .feature = null },
+
+    .{ .bit = .sve, .source = .hwcap, .mask = 1 << 22, .feature = .sve },
+    .{ .bit = .sve2, .source = .hwcap2, .mask = 1 << 1, .feature = .sve2 },
+    .{ .bit = .sveaes, .source = .hwcap2, .mask = 1 << 2, .feature = .sve2_aes },
+    .{ .bit = .svepmull, .source = .hwcap2, .mask = 1 << 3, .feature = null },
+    .{ .bit = .svebitperm, .source = .hwcap2, .mask = 1 << 4, .feature = .sve2_bitperm },
+    .{ .bit = .svesha3, .source = .hwcap2, .mask = 1 << 5, .feature = .sve2_sha3 },
+    .{ .bit = .svesm4, .source = .hwcap2, .mask = 1 << 6, .feature = .sve2_sm4 },
+    .{ .bit = .svei8mm, .source = .hwcap2, .mask = 1 << 9, .feature = null },
+    .{ .bit = .svebf16, .source = .hwcap2, .mask = 1 << 12, .feature = null },
+    .{ .bit = .i8mm, .source = .hwcap2, .mask = 1 << 13, .feature = .i8mm },
+    .{ .bit = .bf16, .source = .hwcap2, .mask = 1 << 14, .feature = .bf16 },
+    .{ .bit = .sme, .source = .hwcap2, .mask = 1 << 23, .feature = .sme },
+};
+
+comptime {
+    // Every Bit tag: exactly one table entry.
+    std.debug.assert(aarch64_table.len == std.enums.values(Bit).len);
+    for (aarch64_table, 0..) |a, i| {
+        for (aarch64_table[i + 1 ..]) |b| {
+            std.debug.assert(a.bit != b.bit);
+        }
+    }
+}
+
+/// The table entry for one bit. Comptime-unique (checked above).
+pub fn bitEntry(bit: Bit) Aarch64Entry {
+    inline for (aarch64_table) |e| {
+        if (e.bit == bit) return e;
+    }
+    unreachable;
+}
+
+/// The wire form: which source word, which bit.
+pub fn spec(bit: Bit) struct { source: format.Source, mask: u64 } {
+    const e = bitEntry(bit);
+    return .{ .source = e.source, .mask = e.mask };
+}
 
 // ---------------------------------------------------------------------------
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
@@ -294,8 +417,8 @@ fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
                     .{v.name},
                 );
             }
-            const s = bit.spec();
-            out[i] = .{ .mask = s.mask, .expected = s.mask, .source = s.source };
+            const e = bitEntry(bit);
+            out[i] = .{ .mask = e.mask, .expected = e.mask, .source = e.source };
         } else {
             const mask = m.mask orelse {
                 return configFail("variant '{s}': raw match needs a mask", .{v.name});

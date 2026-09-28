@@ -25,55 +25,6 @@ const x86 = std.Target.x86;
 /// The kernel vocabulary is finer-grained than LLVM's in three places
 /// (svepmull, svei8mm, svebf16 have no Zig feature) — those stay
 /// explicit-only (the ZON config's raw form).
-fn zigFeature(bit: Bit) ?aarch64.Feature {
-    return switch (bit) {
-        .sve => .sve,
-        .sve2 => .sve2,
-        .sveaes => .sve2_aes,
-        .svepmull => null,
-        .svebitperm => .sve2_bitperm,
-        .svesha3 => .sve2_sha3,
-        .svesm4 => .sve2_sm4,
-        .svei8mm => null,
-        .svebf16 => null,
-        .i8mm => .i8mm,
-        .bf16 => .bf16,
-        .sme => .sme,
-    };
-}
-
-/// Zig x86_64 feature → the CPUID (leaf, subleaf, register, bit) that
-/// advertises it, curated to the psABI-level-defining set (x86-64
-/// v2/v3/v4). Locations pinned from the x86-64 psABI / Intel SDM.
-fn cpuidSpec(feature: x86.Feature) ?pack.Cpuid {
-    return switch (feature) {
-        // CPUID.1H:ECX
-        .ssse3 => .{ .leaf = 1, .register = .ecx, .bit = 9 },
-        .cx16 => .{ .leaf = 1, .register = .ecx, .bit = 13 },
-        .sse4_1 => .{ .leaf = 1, .register = .ecx, .bit = 19 },
-        .sse4_2 => .{ .leaf = 1, .register = .ecx, .bit = 20 },
-        .fma => .{ .leaf = 1, .register = .ecx, .bit = 12 },
-        .movbe => .{ .leaf = 1, .register = .ecx, .bit = 22 },
-        .popcnt => .{ .leaf = 1, .register = .ecx, .bit = 23 },
-        .aes => .{ .leaf = 1, .register = .ecx, .bit = 25 },
-        .avx => .{ .leaf = 1, .register = .ecx, .bit = 28 },
-        .f16c => .{ .leaf = 1, .register = .ecx, .bit = 29 },
-        // CPUID.7H.0H:EBX
-        .bmi => .{ .leaf = 7, .register = .ebx, .bit = 3 },
-        .avx2 => .{ .leaf = 7, .register = .ebx, .bit = 5 },
-        .bmi2 => .{ .leaf = 7, .register = .ebx, .bit = 8 },
-        .avx512f => .{ .leaf = 7, .register = .ebx, .bit = 16 },
-        .avx512dq => .{ .leaf = 7, .register = .ebx, .bit = 17 },
-        .avx512cd => .{ .leaf = 7, .register = .ebx, .bit = 28 },
-        .avx512bw => .{ .leaf = 7, .register = .ebx, .bit = 30 },
-        .avx512vl => .{ .leaf = 7, .register = .ebx, .bit = 31 },
-        // CPUID.80000001H:ECX
-        .sahf => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 0 },
-        .lzcnt => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 5 },
-        else => null,
-    };
-}
-
 /// Infer the dispatch conditions from a target: every inferable condition
 /// whose feature the target has and the arch baseline lacks. aarch64
 /// yields named hwcap bits; x86_64 yields CPUID feature tests.
@@ -82,21 +33,22 @@ fn inferMatches(b: *Build, target: std.Target) []const pack.Match {
     const baseline = std.Target.Cpu.baseline(cpu.arch, target.os);
     var matches: std.ArrayList(pack.Match) = .empty;
     switch (cpu.arch) {
+        // One table read (pack.aarch64_table): wire form + Zig feature
+        // together, comptime-uniqueness-checked. A bit with no Zig feature
+        // (pmull, sha1, ...) can not be inferred — explicit match only.
         .aarch64 => {
-            inline for (comptime std.enums.values(Bit)) |bit| {
-                if (zigFeature(bit)) |feature| {
+            inline for (pack.aarch64_table) |e| {
+                if (e.feature) |feature| {
                     if (cpu.has(.aarch64, feature) and !baseline.has(.aarch64, feature)) {
-                        matches.append(b.allocator, .{ .bit = bit }) catch @panic("OOM");
+                        matches.append(b.allocator, .{ .bit = e.bit }) catch @panic("OOM");
                     }
                 }
             }
         },
         .x86_64 => {
-            inline for (comptime std.enums.values(x86.Feature)) |feature| {
-                if (cpuidSpec(feature)) |c| {
-                    if (cpu.has(.x86, feature) and !baseline.has(.x86, feature)) {
-                        matches.append(b.allocator, .{ .cpuid = c }) catch @panic("OOM");
-                    }
+            inline for (pack.x86_table) |e| {
+                if (cpu.has(.x86, e.feature) and !baseline.has(.x86, e.feature)) {
+                    matches.append(b.allocator, .{ .cpuid = e.cpuid }) catch @panic("OOM");
                 }
             }
         },
@@ -158,20 +110,54 @@ fn modelArch(model: *const std.Target.Cpu.Model) ?std.Target.Cpu.Arch {
     return null;
 }
 
+/// One entry in `targets` (#2): the CPU model that varies, plus an
+/// optional explicit condition override. With `match` empty, chonk infers
+/// the conditions from the model's feature delta over the arch baseline;
+/// an override covers silicon chonk has not heard of — the same escape
+/// hatch the ZON config's raw form provides in the CLI.
+pub const TargetSpec = struct {
+    model: std.Target.Query.CpuModel,
+    match: []const pack.Match = &.{},
+};
+
+/// What chonk hands the consumer's executable factory (#1): everything a
+/// variant's build needs — its auto-derived name, its per-variant resolved
+/// target (skeleton plus model), the optimize mode.
+pub const Variant = struct {
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+};
+
+/// The consumer's per-variant executable factory (#1). Real builds wire
+/// dependency modules (which resolve against a target, so they must be
+/// re-created per variant), options modules, linked system libraries,
+/// `use_llvm`, `strip`, frame pointers. The factory owns all of that;
+/// chonk owns target resolution, condition inference, the fallback
+/// append, the per-species stub, the pack, and the install. Name the
+/// executable `v.name`; chonk never installs it.
+pub const ExeFactory = *const fn (b: *Build, v: Variant) *Step.Compile;
+
 pub const ExecutableOptions = struct {
     /// The fat binary's name — the ONLY name. Installed as
     /// zig-out/bin/<name>; intermediates auto-name from their CPU models.
     name: []const u8,
-    /// The same source for every target.
-    root_source_file: LazyPath,
+    /// The same source for every target. Mutually exclusive with
+    /// `make_exe`; exactly one is required.
+    root_source_file: ?LazyPath = null,
+    /// The per-variant executable factory (#1). When set, chonk calls it
+    /// once per variant — plus the implicit baseline fallback — instead of
+    /// building from `root_source_file`.
+    make_exe: ?ExeFactory = null,
     /// The shared target skeleton — arch, OS, abi, any shared feature
     /// tweaks. This is the SPECIES of the fat binary; every model in
     /// `targets` builds on it, so mixed-arch lists are impossible.
     target: std.Target.Query,
-    /// Per-target CPU models — the only thing that varies. `.baseline` is
-    /// the fallback (exactly one required); it unambiguously means the
-    /// skeleton arch's baseline, never "native on the build machine".
-    targets: []const std.Target.Query.CpuModel,
+    /// Per-target specs — the model is the only thing that varies.
+    /// `.baseline` is the fallback (exactly one required); it
+    /// unambiguously means the skeleton arch's baseline, never "native
+    /// on the build machine".
+    targets: []const TargetSpec,
     optimize: std.builtin.OptimizeMode = .Debug,
     /// Wire the zig-out/bin/<name> install.
     install: bool = true,
@@ -204,17 +190,26 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         @panic("chonk.addExecutable: list at least one variant target — " ++
             "the arch-baseline fallback is appended automatically");
     }
+    if (options.make_exe == null and options.root_source_file == null) {
+        @panic("chonk.addExecutable: set root_source_file or make_exe");
+    }
+    if (options.make_exe != null and options.root_source_file != null) {
+        @panic("chonk.addExecutable: root_source_file and make_exe are " ++
+            "mutually exclusive");
+    }
 
-    // Resolve every model onto the shared skeleton; infer its dispatch
-    // conditions; find the fallback. The skeleton fixes the species, so
-    // mixed-arch builds are impossible by construction. One slot is held
-    // for the implicit arch-baseline fallback, used when no listed target
-    // is itself the fallback — the baseline is always derivable from the
-    // skeleton, so requiring it explicitly would be ceremony.
+    // Resolve every model onto the shared skeleton; infer or take its
+    // dispatch conditions; find the fallback. The skeleton fixes the
+    // species, so mixed-arch builds are impossible by construction. One
+    // slot is held for the implicit arch-baseline fallback, used when no
+    // listed target is itself the fallback — the baseline is always
+    // derivable from the skeleton, so requiring it explicitly would be
+    // ceremony.
     const targets = b.allocator.alloc(ResolvedTarget, options.targets.len + 1) catch @panic("OOM");
     var used: usize = 0;
     var fallback_count: usize = 0;
-    for (options.targets) |model| {
+    for (options.targets) |spec| {
+        const model = spec.model;
         if (model == .explicit and options.target.cpu_arch != null) {
             // Model records carry no arch — the tables are namespaced by
             // arch, so scan them and compare pointers. Without this, a
@@ -231,13 +226,17 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         var query = options.target;
         query.cpu_model = model;
         const resolved = b.resolveTargetQuery(query);
-        const match = inferMatches(b, resolved.result);
+        // An explicit match overrides inference (#2): it covers silicon
+        // chonk has not heard of, and the unmappable bits (pmull, sha1,
+        // ...) that inference can never express.
+        const match = if (spec.match.len > 0) spec.match else inferMatches(b, resolved.result);
         const fallback = isBaseline(resolved.result);
         if (fallback) {
             fallback_count += 1;
         } else if (match.len == 0) {
             @panic(b.fmt(
-                "chonk.addExecutable: target '{s}' maps to no dispatchable feature",
+                "chonk.addExecutable: target '{s}' maps to no dispatchable feature; " ++
+                    "set an explicit match or pick a model with a mapped feature delta",
                 .{resolved.result.cpu.model.name},
             ));
         }
@@ -268,17 +267,30 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
     const variants = targets[0..used];
 
     // The intermediates: one build per target, auto-named from the CPU
-    // model, cache-only, never installed.
+    // model, cache-only, never installed. With make_exe (#1), the consumer's
+    // factory builds each variant — dependencies, linked libraries, and
+    // compile options resolve against the per-variant target, so every
+    // variant needs its own module; the factory is called once per variant
+    // with everything it needs. Without it, the simple root_source_file
+    // path — one source, no imports.
     const exes = b.allocator.alloc(*Step.Compile, variants.len) catch @panic("OOM");
     for (variants, 0..) |t, i| {
-        exes[i] = b.addExecutable(.{
-            .name = t.name,
-            .root_module = b.createModule(.{
-                .root_source_file = options.root_source_file,
+        if (options.make_exe) |make| {
+            exes[i] = make(b, .{
+                .name = t.name,
                 .target = t.resolved,
                 .optimize = options.optimize,
-            }),
-        });
+            });
+        } else {
+            exes[i] = b.addExecutable(.{
+                .name = t.name,
+                .root_module = b.createModule(.{
+                    .root_source_file = options.root_source_file.?,
+                    .target = t.resolved,
+                    .optimize = options.optimize,
+                }),
+            });
+        }
     }
 
     // The freestanding stub for THIS species, compiled into THIS build
@@ -461,29 +473,37 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(exe);
 
-    // The freestanding dispatcher. No libc — raw syscalls only, custom
-    // naked `_start` entry (src/stub.zig). Freestanding target is what keeps
-    // std.start out: on linux targets the compiler force-analyzes std.zig,
-    // which force-analyzes std.start, which demands a `main` and fights over
-    // the `_start` symbol. Freestanding skips all of that; std.os.linux
-    // wrappers still compile (arch-gated, not os-gated).
-    const stub = b.addExecutable(.{
-        .name = "stub",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/stub.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .freestanding,
+    // The freestanding dispatchers, one per species (#3): no libc — raw
+    // syscalls only, custom naked `_start` entry (src/stub.zig). Freestanding
+    // target is what keeps std.start out: on linux targets the compiler
+    // force-analyzes std.zig, which force-analyzes std.start, which demands a
+    // `main` and fights over the `_start` symbol. Freestanding skips all of
+    // that; std.os.linux wrappers still compile (arch-gated, not os-gated).
+    // Always ReleaseSmall + stripped — compiled-once-forever artifacts (~3
+    // pages), for the CLI pack path. The build API compiles its own per
+    // species at addExecutable time.
+    inline for ([_]struct { []const u8, std.Target.Cpu.Arch }{
+        .{ "stub-aarch64", .aarch64 },
+        .{ "stub-x86_64", .x86_64 },
+    }) |stub_spec| {
+        const stub = b.addExecutable(.{
+            .name = stub_spec[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/stub.zig"),
+                .target = b.resolveTargetQuery(.{
+                    .cpu_arch = stub_spec[1],
+                    .os_tag = .freestanding,
+                }),
+                .optimize = .ReleaseSmall,
+                .strip = true,
+                .single_threaded = true,
             }),
-            .optimize = optimize,
-            .strip = optimize != .Debug,
-            .single_threaded = true,
-        }),
-    });
+        });
 
-    stub.entry = .enabled;
+        stub.entry = .enabled;
 
-    b.installArtifact(stub);
+        b.installArtifact(stub);
+    }
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
