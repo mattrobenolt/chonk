@@ -38,17 +38,17 @@ pub fn build(b: *Build) void {
     const chonk = b.lazyImport(@This(), "chonk") orelse return;
     const chonk_step = b.step("chonk", "Build the fat binaries");
 
-    // aarch64: the Neoverse tiers + baseline fallback. Every target names
-    // its arch explicitly: a bare .{ .cpu_model = .baseline } would mean
-    // native on whatever machine builds this.
+    // aarch64: the Neoverse tiers + baseline fallback. The skeleton carries
+    // the species (arch + abi); only the cpu model varies per target.
     const fat_arm = chonk.addExecutable(b, .{
         .name = "app",
         .root_source_file = b.path("src/main.zig"),
+        .target = .{ .cpu_arch = .aarch64, .abi = .musl },
         .optimize = optimize,
         .install = false, // wired into the chonk step below, not the default
         .targets = &.{
-            .{ .cpu_arch = .aarch64, .abi = .musl, .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
-            .{ .cpu_arch = .aarch64, .abi = .musl, .cpu_model = .baseline }, // the fallback
+            .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
+            .baseline, // the fallback
         },
     });
     const install_arm = b.addInstallFileWithDir(fat_arm, .bin, "app");
@@ -59,11 +59,12 @@ pub fn build(b: *Build) void {
     const fat_x86 = chonk.addExecutable(b, .{
         .name = "app",
         .root_source_file = b.path("src/main.zig"),
+        .target = .{ .cpu_arch = .x86_64, .abi = .musl },
         .optimize = optimize,
         .install = false,
         .targets = &.{
-            .{ .cpu_arch = .x86_64, .abi = .musl, .cpu_model = .{ .explicit = &Target.x86.cpu.x86_64_v3 } },
-            .{ .cpu_arch = .x86_64, .abi = .musl, .cpu_model = .baseline }, // the fallback
+            .{ .explicit = &Target.x86.cpu.x86_64_v3 },
+            .baseline, // the fallback
         },
     });
     const install_x86 = b.addInstallFileWithDir(fat_x86, .bin, "app-x86_64");

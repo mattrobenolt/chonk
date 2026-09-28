@@ -134,17 +134,44 @@ fn isBaseline(target: std.Target) bool {
 
 /// `chonk.addExecutable` options — the `b.addExecutable` shape with the
 /// name and a target list instead of a single target.
+/// Which arch's model table does this model come from? The records carry
+/// no arch — the tables do (Target.<arch>.cpu.*). Comptime-scanned, the
+/// pointers compared at graph time.
+/// Which arch's model table does this model come from? The records carry
+/// no arch — the tables do (Target.<arch>.cpu.*). Comptime-scanned, the
+/// pointers compared at graph time. Without this check, a copy-pasted
+/// model from another arch silently builds garbage.
+fn modelArch(model: *const std.Target.Cpu.Model) ?std.Target.Cpu.Arch {
+    const tables = .{
+        .{ std.Target.Cpu.Arch.aarch64, std.Target.aarch64.cpu },
+        .{ std.Target.Cpu.Arch.x86_64, std.Target.x86.cpu },
+    };
+    inline for (tables) |t| {
+        const arch = t[0];
+        const ns = t[1];
+        inline for (comptime @typeInfo(ns).@"struct".decls) |decl| {
+            if (@TypeOf(@field(ns, decl.name)) == std.Target.Cpu.Model) {
+                if (&@field(ns, decl.name) == model) return arch;
+            }
+        }
+    }
+    return null;
+}
+
 pub const ExecutableOptions = struct {
     /// The fat binary's name — the ONLY name. Installed as
     /// zig-out/bin/<name>; intermediates auto-name from their CPU models.
     name: []const u8,
     /// The same source for every target.
     root_source_file: LazyPath,
-    /// Compilation targets. The arch-baseline target (usually
-    /// `.{ .cpu_model = .baseline }`) is the fallback — exactly one
-    /// required. Every other target dispatches on the hwcap bits implied
-    /// by its features over baseline.
-    targets: []const std.Target.Query,
+    /// The shared target skeleton — arch, OS, abi, any shared feature
+    /// tweaks. This is the SPECIES of the fat binary; every model in
+    /// `targets` builds on it, so mixed-arch lists are impossible.
+    target: std.Target.Query,
+    /// Per-target CPU models — the only thing that varies. `.baseline` is
+    /// the fallback (exactly one required); it unambiguously means the
+    /// skeleton arch's baseline, never "native on the build machine".
+    targets: []const std.Target.Query.CpuModel,
     optimize: std.builtin.OptimizeMode = .Debug,
     /// Wire the zig-out/bin/<name> install.
     install: bool = true,
@@ -159,35 +186,42 @@ pub const ExecutableOptions = struct {
 ///     _ = chonk.addExecutable(b, .{
 ///         .name = "app",
 ///         .root_source_file = b.path("src/main.zig"),
+///         .target = .{ .cpu_arch = .aarch64, .abi = .musl },
 ///         .optimize = optimize,
 ///         .targets = &.{
-///             .{ .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
-///             .{ .cpu_model = .baseline }, // the fallback
+///             .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
+///             .baseline, // the fallback
 ///         },
 ///     });
 ///
 /// Returns the fat binary's LazyPath; installs it as zig-out/bin/<name>
 /// unless `install = false`.
 ///
-/// One fat binary per architecture: the trailer's machine field is a
-/// species check, so call once per arch with that arch's targets.
+/// One fat binary per species: the skeleton's arch decides, so call once
+/// per arch with that arch's models.
 pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
-    // Resolve every target; infer its dispatch conditions; find the
-    // fallback. Every target must be one species — one fat binary per
-    // architecture.
-    var species: ?std.Target.Cpu.Arch = null;
+    // Resolve every model onto the shared skeleton; infer its dispatch
+    // conditions; find the fallback. The skeleton fixes the species, so
+    // mixed-arch builds are impossible by construction.
     const targets = b.allocator.alloc(ResolvedTarget, options.targets.len) catch @panic("OOM");
     var fallback_count: usize = 0;
-    for (options.targets, 0..) |query, i| {
-        const resolved = b.resolveTargetQuery(query);
-        if (species) |s| {
-            if (resolved.result.cpu.arch != s) {
-                @panic("chonk.addExecutable: one fat binary per architecture — " ++
-                    "split mixed-arch target lists into one call per arch");
+    for (options.targets, 0..) |model, i| {
+        if (model == .explicit and options.target.cpu_arch != null) {
+            // Model records carry no arch — the tables are namespaced by
+            // arch, so scan them and compare pointers. Without this, a
+            // copy-pasted model from another arch silently builds garbage.
+            const implied = modelArch(model.explicit);
+            if (implied != null and implied.? != options.target.cpu_arch.?) {
+                const skeleton_arch = @tagName(options.target.cpu_arch.?);
+                @panic(b.fmt(
+                    "chonk.addExecutable: model '{s}' is {s}, not {s}",
+                    .{ model.explicit.name, @tagName(implied.?), skeleton_arch },
+                ));
             }
-        } else {
-            species = resolved.result.cpu.arch;
         }
+        var query = options.target;
+        query.cpu_model = model;
+        const resolved = b.resolveTargetQuery(query);
         const match = inferMatches(b, resolved.result);
         const fallback = isBaseline(resolved.result);
         if (fallback) {
@@ -207,7 +241,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
     }
     if (fallback_count != 1) {
         @panic("chonk.addExecutable: exactly one target must be the arch " ++
-            "baseline (the fallback) — e.g. .{ .cpu_model = .baseline }");
+            "baseline (the fallback) — the bare .baseline model");
     }
 
     // The intermediates: one build per target, auto-named from the CPU
@@ -226,9 +260,11 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
 
     // The freestanding stub for THIS species, compiled into THIS build
     // graph from source. Compiled-once-forever: always ReleaseSmall +
-    // stripped, regardless of the consumer's optimize setting.
+    // stripped, regardless of the consumer's optimize setting. The
+    // skeleton's resolved arch decides.
     const dep = b.dependency("chonk", .{});
-    const stub_target: std.Target.Query = switch (species.?) {
+    const species = b.resolveTargetQuery(options.target).result.cpu.arch;
+    const stub_target: std.Target.Query = switch (species) {
         .aarch64 => .{ .cpu_arch = .aarch64, .os_tag = .freestanding },
         .x86_64 => .{ .cpu_arch = .x86_64, .os_tag = .freestanding },
         else => @panic("chonk.addExecutable: unsupported arch"),
