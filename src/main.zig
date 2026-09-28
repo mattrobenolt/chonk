@@ -43,13 +43,12 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
-/// Print top-level usage and return exit code 2. Returning through main
-/// runs its `defer stdio.flush()` — no direct `process.exit` remains.
+/// Print top-level usage and return exit code 2.
 fn usageExit() u8 {
     const usage =
         \\ usage: chonk <command> [args]
         \\   chonk pack <stub> <config.zon> <output>  pack a fat binary from a config
-        \\   chonk inspect <binary>                 print a fat binary's variant table
+        \\   chonk inspect <binary>                   print a fat binary's variant table
     ;
     stdio.writeAll(.err, usage ++ "\n");
     return 2;

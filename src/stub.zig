@@ -11,6 +11,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const elf = std.elf;
+
 const format = @import("format.zig");
 
 /// This stub's species — the x86_64 twin switches this at comptime.
@@ -159,6 +160,7 @@ fn preadFull(fd: linux.fd_t, buf: []u8, offset: i64) void {
 
 /// Report to stderr and die — the only exit that is not execveat.
 fn fatal(comptime what: []const u8) noreturn {
+    @branchHint(.cold);
     var stderr_buffer: [128]u8 = undefined;
     var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
     w.append("chonk: ");
@@ -169,6 +171,7 @@ fn fatal(comptime what: []const u8) noreturn {
 }
 
 fn fatalSyscall(comptime what: []const u8, rc: usize) noreturn {
+    @branchHint(.cold);
     var stderr_buffer: [160]u8 = undefined;
     var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
     w.append("chonk: ");
