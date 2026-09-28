@@ -211,40 +211,46 @@ build.zig.zon:
 .chonk = .{ .path = "../chonk" },
 ```
 
-its build.zig:
+its build.zig — the near-drop-in replacement for `b.addExecutable`, with a
+list of compilation targets instead of one:
 
 ```zig
 const chonk = b.lazyImport(@This(), "chonk") orelse return;
-_ = chonk.addFatBinary(b, .{
+_ = chonk.addExecutable(b, .{
     .name = "app",
-    .variants = &.{
-        .{ .exe = app_v2, .name = "neoverse-v2", .bit = .sve2 },
-        .{ .exe = app_baseline, .name = "baseline" }, // the fallback
+    .root_source_file = b.path("src/main.zig"),
+    .optimize = optimize,
+    .targets = &.{
+        .{ .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
+        .{ .cpu_model = .baseline }, // the fallback
     },
 });
 ```
 
+- One call, one name, a target list. Dispatch conditions are INFERRED from
+  each target's feature delta over the arch baseline (neoverse_v2 ⇒ the
+  SVE2-family bits); the arch-baseline target is the fallback — exactly one
+  required. `.{ .cpu_model = .baseline }`, NOT `.{}` — a bare `.{}` means
+  native-on-the-build-machine, which on V2 hardware builds a V2 binary as
+  the "fallback" (caught live in the consumer example).
+- The kernel vocabulary is finer than LLVM's in three places (svepmull,
+  svei8mm, svebf16 have no Zig feature) — those bits stay explicit-only
+  (the ZON config's raw form).
+- Intermediates auto-name from their CPU models ("neoverse_v2",
+  "generic"), cache-only, never installed; display names likewise.
 - `b.lazyImport` hands the consumer this repo's build.zig struct, which
-  re-exports `pack.zig` (the same module the CLI uses). `addFatBinary` runs
-  IN-PROCESS: a custom `PackStep` whose make() calls `pack.packAll` with
-  `b.graph.io` — no subprocess, no argv marshalling. The freestanding stub
-  is compiled into the CONSUMER's graph from source (ReleaseSmall, always)
-  via `dep.path("src/stub.zig")`.
-- The step is content-addressed like any build step (manifest over stub +
-  payload files + conditions); installs `zig-out/bin/<name>` unless
-  `install = false` — the fat file's LazyPath is returned either way.
-- The API and the ZON config share one vocabulary: `Match`/`Bit` are
-  defined once in pack.zig; a config typo and a build.zig typo fail the
-  same way. Only the payload reference differs (path string vs `exe`).
-- Inference (planned): when `bit` is omitted on a non-fallback variant,
-  derive conditions from the exe's target — the feature delta over
-  baseline, mapped through the same enum.
+  re-exports `pack.zig` (the same module the CLI uses). The custom
+  `PackStep`'s make() calls `pack.packAll` with `b.graph.io` — in-process,
+  no subprocess, no argv. The freestanding stub compiles into the
+  CONSUMER's graph from source (ReleaseSmall, always) via
+  `dep.path("src/stub.zig")`. Content-addressed like any build step.
 - One fat binary per architecture: the trailer's machine field is a species
   check. Cross-arch universal binaries are not possible on Linux — the
   kernel loads the front ELF as the stub's arch and has no Mach-O-style
-  arch pick; call `addFatBinary` once per arch instead.
-- Working example: `examples/consumer/` — the same app built for
-  neoverse_v2 and baseline, one fat binary out.
+  arch pick; call `chonk.addExecutable` once per arch with that arch's
+  targets.
+- Working example: `examples/consumer/` — the whole integration is the one
+  call above.
 
 ---
 

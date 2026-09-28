@@ -18,38 +18,91 @@ const stdio = @import("src/stdio.zig");
 pub const Match = pack.Match;
 pub const Bit = pack.Bit;
 
-/// One variant for `addFatBinary`: an executable plus what distinguishes
-/// it. `bit == null` marks the fallback — exactly one variant must omit
-/// it. Build the executable per CPU target exactly as you normally would;
-/// the packer checks every variant agrees on machine.
-pub const FatVariant = struct {
-    exe: *Step.Compile,
-    /// Display name; defaults to the exe's name.
-    name: ?[]const u8 = null,
-    /// Kernel hwcap bit that must be set for this variant to win.
-    bit: ?Bit = null,
-};
+const aarch64 = std.Target.aarch64;
 
-pub const FatBinaryOptions = struct {
-    /// Installed as zig-out/bin/<name>.
-    name: []const u8 = "fat",
-    variants: []const FatVariant,
+/// Bit → the Zig target feature that implies it, where one exists. The
+/// kernel vocabulary is finer-grained than LLVM's in three places
+/// (svepmull, svei8mm, svebf16 have no Zig feature) — those stay
+/// explicit-only (the ZON config's raw form).
+fn zigFeature(bit: Bit) ?aarch64.Feature {
+    return switch (bit) {
+        .sve => .sve,
+        .sve2 => .sve2,
+        .sveaes => .sve2_aes,
+        .svepmull => null,
+        .svebitperm => .sve2_bitperm,
+        .svesha3 => .sve2_sha3,
+        .svesm4 => .sve2_sm4,
+        .svei8mm => null,
+        .svebf16 => null,
+        .i8mm => .i8mm,
+        .bf16 => .bf16,
+        .sme => .sme,
+    };
+}
+
+/// Infer the dispatch conditions from a target: every inferable bit whose
+/// feature the target has and the arch baseline lacks.
+fn inferBits(b: *Build, target: std.Target) []const Bit {
+    const cpu = target.cpu;
+    const baseline = std.Target.Cpu.baseline(cpu.arch, target.os);
+    var bits: std.ArrayList(Bit) = .empty;
+    inline for (comptime std.enums.values(Bit)) |bit| {
+        if (zigFeature(bit)) |feature| {
+            if (cpu.has(.aarch64, feature) and !baseline.has(.aarch64, feature)) {
+                bits.append(b.allocator, bit) catch @panic("OOM");
+            }
+        }
+    }
+    return bits.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// The fallback target: identical to the arch baseline. `.{ .target = .{} }`
+/// is NOT this — it means native on the build machine, which on V2
+/// hardware builds a V2 binary as the "fallback". Use
+/// `.{ .cpu_model = .baseline }`.
+fn isBaseline(target: std.Target) bool {
+    const cpu = target.cpu;
+    const baseline = std.Target.Cpu.baseline(cpu.arch, target.os);
+    inline for (comptime std.enums.values(aarch64.Feature)) |feature| {
+        if (cpu.has(.aarch64, feature) != baseline.has(.aarch64, feature)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `chonk.addExecutable` options — the `b.addExecutable` shape with the
+/// name and a target list instead of a single target.
+pub const ExecutableOptions = struct {
+    /// The fat binary's name — the ONLY name. Installed as
+    /// zig-out/bin/<name>; intermediates auto-name from their CPU models.
+    name: []const u8,
+    /// The same source for every target.
+    root_source_file: LazyPath,
+    /// Compilation targets. The arch-baseline target (usually
+    /// `.{ .cpu_model = .baseline }`) is the fallback — exactly one
+    /// required. Every other target dispatches on the hwcap bits implied
+    /// by its features over baseline.
+    targets: []const std.Target.Query,
+    optimize: std.builtin.OptimizeMode = .Debug,
     /// Wire the zig-out/bin/<name> install.
     install: bool = true,
 };
 
-/// Build-system integration: pack `variants` plus this repo's freestanding
-/// stub into one fat binary that picks a payload by CPU features at exec
-/// time. The stub is compiled into THIS build graph from source; the pack
-/// step runs the same module the CLI uses, in-process. From another
-/// project's build.zig, with this repo as a `chonk` dependency:
+/// chonk's `b.addExecutable`: one call, a list of compilation targets, one
+/// fat binary out that picks a payload by CPU features at exec time. The
+/// near-drop-in replacement, from another project's build.zig with this
+/// repo as a `chonk` dependency:
 ///
 ///     const chonk = b.lazyImport(@This(), "chonk") orelse return;
-///     _ = chonk.addFatBinary(b, .{
+///     _ = chonk.addExecutable(b, .{
 ///         .name = "app",
-///         .variants = &.{
-///             .{ .exe = app_v2, .bit = .sve2 },
-///             .{ .exe = app_baseline }, // the fallback
+///         .root_source_file = b.path("src/main.zig"),
+///         .optimize = optimize,
+///         .targets = &.{
+///             .{ .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
+///             .{ .cpu_model = .baseline }, // the fallback
 ///         },
 ///     });
 ///
@@ -57,14 +110,47 @@ pub const FatBinaryOptions = struct {
 /// unless `install = false`.
 ///
 /// One fat binary per architecture: the trailer's machine field is a
-/// species check, so call once per arch with that arch's variants.
-pub fn addFatBinary(b: *Build, options: FatBinaryOptions) LazyPath {
+/// species check, so call once per arch with that arch's targets.
+pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
+    // Resolve every target; infer its dispatch bits; find the fallback.
+    const targets = b.allocator.alloc(ResolvedTarget, options.targets.len) catch @panic("OOM");
     var fallback_count: usize = 0;
-    for (options.variants) |v| {
-        if (v.bit == null) fallback_count += 1;
+    for (options.targets, 0..) |query, i| {
+        const resolved = b.resolveTargetQuery(query);
+        const bits = inferBits(b, resolved.result);
+        const fallback = isBaseline(resolved.result);
+        if (fallback) {
+            fallback_count += 1;
+        } else if (bits.len == 0) {
+            @panic(b.fmt(
+                "chonk.addExecutable: target '{s}' maps to no hwcap bit",
+                .{resolved.result.cpu.model.name},
+            ));
+        }
+        targets[i] = .{
+            .name = resolved.result.cpu.model.name,
+            .resolved = resolved,
+            .bits = bits,
+            .fallback = fallback,
+        };
     }
     if (fallback_count != 1) {
-        @panic("addFatBinary: exactly one variant must omit 'bit' (the fallback)");
+        @panic("chonk.addExecutable: exactly one target must be the arch " ++
+            "baseline (the fallback) — e.g. .{ .cpu_model = .baseline }");
+    }
+
+    // The intermediates: one build per target, auto-named from the CPU
+    // model, cache-only, never installed.
+    const exes = b.allocator.alloc(*Step.Compile, targets.len) catch @panic("OOM");
+    for (targets, 0..) |t, i| {
+        exes[i] = b.addExecutable(.{
+            .name = t.name,
+            .root_module = b.createModule(.{
+                .root_source_file = options.root_source_file,
+                .target = t.resolved,
+                .optimize = options.optimize,
+            }),
+        });
     }
 
     // The freestanding stub, compiled into THIS build graph from source.
@@ -87,12 +173,12 @@ pub fn addFatBinary(b: *Build, options: FatBinaryOptions) LazyPath {
     stub.entry = .enabled;
 
     const pack_step = b.allocator.create(PackStep) catch @panic("OOM");
-    const inputs = b.allocator.alloc(PackStep.Input, options.variants.len) catch @panic("OOM");
-    for (options.variants, 0..) |v, i| {
+    const inputs = b.allocator.alloc(PackStep.Input, targets.len) catch @panic("OOM");
+    for (targets, 0..) |t, i| {
         inputs[i] = .{
-            .name = v.name orelse v.exe.name,
-            .payload = v.exe.getEmittedBin(),
-            .bit = v.bit,
+            .name = t.name,
+            .payload = exes[i].getEmittedBin(),
+            .bits = t.bits,
         };
     }
     pack_step.* = .{
@@ -110,8 +196,8 @@ pub fn addFatBinary(b: *Build, options: FatBinaryOptions) LazyPath {
 
     // The pack runs after the stub + every variant compiles.
     pack_step.step.dependOn(&stub.step);
-    for (options.variants) |v| {
-        pack_step.step.dependOn(&v.exe.step);
+    for (exes) |exe| {
+        pack_step.step.dependOn(&exe.step);
     }
 
     const fat: LazyPath = .{ .generated = .{ .file = &pack_step.fat } };
@@ -126,6 +212,15 @@ pub fn addFatBinary(b: *Build, options: FatBinaryOptions) LazyPath {
 
 /// Packs a fat binary in-process: the same module the CLI uses, run by the
 /// build runner with b.graph.io — no subprocess, no argv marshalling.
+/// One resolved target: the auto-name, the resolved query, the inferred
+/// dispatch bits, and whether it is the arch-baseline fallback.
+const ResolvedTarget = struct {
+    name: []const u8,
+    resolved: std.Build.ResolvedTarget,
+    bits: []const Bit,
+    fallback: bool,
+};
+
 const PackStep = struct {
     step: Step,
     fat: Build.GeneratedFile,
@@ -136,7 +231,8 @@ const PackStep = struct {
     const Input = struct {
         name: []const u8,
         payload: LazyPath,
-        bit: ?Bit,
+        /// Empty = the fallback.
+        bits: []const Bit,
     };
 
     fn make(step: *Step, options: Step.MakeOptions) anyerror!void {
@@ -153,7 +249,10 @@ const PackStep = struct {
         _ = try man.addFilePath(self.stub.getPath3(b, step), null);
         for (self.inputs) |input| {
             man.hash.addBytes(input.name);
-            man.hash.addBytes(if (input.bit) |bit| @tagName(bit) else "(fallback)");
+            for (input.bits) |bit| {
+                man.hash.addBytes(@tagName(bit));
+            }
+            man.hash.addBytes("(end)");
             _ = try man.addFilePath(input.payload.getPath3(b, step), null);
         }
 
@@ -179,11 +278,10 @@ const PackStep = struct {
         const cwd = Io.Dir.cwd();
         const variants = try arena.alloc(pack.Variant, self.inputs.len);
         for (self.inputs, 0..) |input, i| {
-            const match: []pack.Match = if (input.bit) |bit| blk: {
-                const one = try arena.create(pack.Match);
-                one.* = .{ .bit = bit };
-                break :blk one[0..1];
-            } else &.{};
+            const match = try arena.alloc(pack.Match, input.bits.len);
+            for (input.bits, 0..) |bit, j| {
+                match[j] = .{ .bit = bit };
+            }
             variants[i] = .{
                 .name = input.name,
                 .binary = input.payload.getPath2(b, step),
