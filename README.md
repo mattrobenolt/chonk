@@ -146,6 +146,12 @@ From the repository root:
 - `cd examples/consumer && zig build chonk` — build the example release
   fleet.
 
+The wordmark: `chonk-orig.svg` is the source of truth, and `chonk.svg`
+is the minified copy that the README banner uses. Do not run default svgo
+on the orig — its `inlineStyles` plugin strips the `prefers-color-scheme`
+media query, which breaks dark mode. The orig also carries a C2PA
+provenance manifest, so do not edit it; a change breaks the signature.
+
 The devshell provides qemu-user. Use `-cpu` models to verify dispatch
 under controlled CPU identities:
 
