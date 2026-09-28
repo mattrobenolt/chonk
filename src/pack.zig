@@ -22,6 +22,7 @@ const elf = std.elf;
 const fs_path = std.fs.path;
 const assert = std.debug.assert;
 const zon = std.zon;
+const Wyhash = std.hash.Wyhash;
 
 const format = @import("format.zig");
 const stdio = @import("stdio.zig");
@@ -316,15 +317,31 @@ pub fn packAll(
     const named = try normalizeConfig(arena, config);
     const loaded = try loadVariants(io, arena, config_dir, named, stub_machine);
 
-    const lay = try writeFat(io, arena, cwd, out_path, stub, stub_machine, loaded);
+    const lay = try writeFat(io, arena, cwd, config_dir, out_path, stub, stub_machine, loaded);
 
-    stdio.print(.out, "packed: {d} variants, total {d}", .{ loaded.len, lay.size });
-    for (loaded, lay.payload_offsets) |v, offset| {
+    var unique_count: usize = 0;
+    for (loaded) |v| unique_count = @max(unique_count, v.payload_index + 1);
+    stdio.print(.out, "packed: {d} variants ({d} unique payload(s)), total {d}", .{
+        loaded.len, unique_count, lay.size,
+    });
+    for (loaded, 0..) |v, i| {
+        const offset = lay.payload_offsets[v.payload_index];
+        var shared = false;
+        for (loaded[0..i]) |prev| {
+            if (prev.payload_index == v.payload_index) shared = true;
+        }
         const suffix: []const u8 = if (v.cfg.match.len == 0) ", fallback" else "";
         stdio.print(
             .out,
-            "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s})",
-            .{ v.cfg.name, offset, v.payload.len, v.conditions.len, suffix },
+            "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s}{s})",
+            .{
+                v.cfg.name,
+                offset,
+                v.payload.size,
+                v.conditions.len,
+                suffix,
+                if (shared) ", shared" else "",
+            },
         );
     }
     return 0;
@@ -375,11 +392,30 @@ fn normalizeConfig(arena: Allocator, config: Config) Allocator.Error![]NamedVari
 }
 
 /// One validated variant: config + payload bytes + compiled conditions.
+/// `payload_index` indexes the unique-payload list — variants with
+/// identical payload bytes share a slot and a `payload_offset` in the fat
+/// binary (a size optimization; dispatch is unchanged).
+/// A payload file by reference — never resident. `digest` is the
+/// streaming Wyhash of the load-time bytes; the copy pass re-hashes and
+/// verifies it, so a payload that changed between dedup and write fails
+/// the pack instead of shipping unverified bytes.
+const PayloadRef = struct {
+    /// As written in the config — resolved against `config_dir`.
+    path: []const u8,
+    size: u64,
+    digest: u64,
+};
+
 const LoadedVariant = struct {
     cfg: NamedVariant,
-    payload: []const u8,
+    payload: PayloadRef,
+    payload_index: usize,
     conditions: []const format.Condition,
 };
+
+/// The ELF header is 64 bytes; elfCheck needs none past e_entry (offset
+/// 24 + 8). Positioned read, no residency.
+const header_len = 64;
 
 fn loadVariants(
     io: Io,
@@ -389,22 +425,120 @@ fn loadVariants(
     stub_machine: u16,
 ) ![]LoadedVariant {
     const loaded = try arena.alloc(LoadedVariant, variants.len);
+    var unique_payloads: std.ArrayList(PayloadRef) = .empty;
     for (variants, 0..) |v, i| {
-        const payload = try readFile(io, arena, config_dir, v.binary);
-        const ident = try elfCheck(v.binary, payload);
+        var file = config_dir.openFile(io, v.binary, .{}) catch |err| {
+            logFail(v.binary, "open", err);
+            return err;
+        };
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.size > max_file_size) {
+            logFail(v.binary, "size", error.FileTooBig);
+            return error.FileTooBig;
+        }
+
+        var header: [header_len]u8 = @splat(0);
+        _ = try file.readPositionalAll(io, &header, 0);
+        const header_slice = header[0..@intCast(@min(@as(u64, header_len), stat.size))];
+        const ident = try elfCheck(v.binary, header_slice);
         if (ident.machine != stub_machine) {
             return configFail("{s}: machine mismatch with stub", .{v.binary});
         }
         if (!ident.is_program) {
             return configFail("{s}: not an executable — a library or no entry", .{v.binary});
         }
+
+        // Dedup identical payload bytes: streaming hash first, then a full
+        // streaming compare on a hit (a hash collision must never merge two
+        // different binaries). Neither pass holds the file resident.
+        const digest = try hashFile(io, file);
+        const ref: PayloadRef = .{ .path = v.binary, .size = stat.size, .digest = digest };
+        var payload_index: usize = unique_payloads.items.len;
+        for (unique_payloads.items, 0..) |u, j| {
+            if (u.digest == digest and u.size == stat.size and
+                try filesEql(io, config_dir, u.path, v.binary))
+            {
+                payload_index = j;
+                break;
+            }
+        }
+        if (payload_index == unique_payloads.items.len) {
+            unique_payloads.append(arena, ref) catch @panic("OOM");
+        }
         loaded[i] = .{
             .cfg = v,
-            .payload = payload,
+            .payload = ref,
+            .payload_index = payload_index,
             .conditions = try compileMatches(arena, v),
         };
     }
+    try assertSeparation(loaded);
     return loaded;
+}
+
+/// Streaming hash of an open file from its current position to EOF.
+fn hashFile(io: Io, file: Io.File) !u64 {
+    var fr = file.reader(io, &.{});
+    var hasher = Wyhash.init(0);
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const amt = try fr.interface.readSliceShort(&buf);
+        if (amt == 0) break;
+        hasher.update(buf[0..amt]);
+    }
+    return hasher.final();
+}
+
+/// Chunk-wise file equality — no residency. Callers pre-check size.
+fn filesEql(io: Io, config_dir: Io.Dir, a_path: []const u8, b_path: []const u8) !bool {
+    var fa = config_dir.openFile(io, a_path, .{}) catch return false;
+    defer fa.close(io);
+    var fb = config_dir.openFile(io, b_path, .{}) catch return false;
+    defer fb.close(io);
+    var ra = fa.reader(io, &.{});
+    var rb = fb.reader(io, &.{});
+    var buf_a: [16384]u8 = undefined;
+    var buf_b: [16384]u8 = undefined;
+    while (true) {
+        const na = try ra.interface.readSliceShort(&buf_a);
+        const nb = try rb.interface.readSliceShort(&buf_b);
+        if (na != nb) return false;
+        if (na == 0) return true;
+        if (!mem.eql(u8, buf_a[0..na], buf_b[0..nb])) return false;
+    }
+}
+
+/// Identical conditions + different payload bytes is the V3/V2 hazard:
+/// first-match hands the earlier tier's binary to the later tier's
+/// machines, and if that binary uses an instruction those machines lack,
+/// the dispatch SIGILLs. Identical conditions + identical bytes (the OR
+/// pattern) is legal — the entries are dead weight, not a hazard.
+fn assertSeparation(loaded: []const LoadedVariant) !void {
+    for (loaded, 0..) |a, i| {
+        for (loaded[i + 1 ..]) |b| {
+            if (a.payload_index != b.payload_index and
+                conditionsEql(a.conditions, b.conditions))
+            {
+                return configFail(
+                    "variants '{s}' and '{s}' have identical conditions but " ++
+                        "different binaries — the later can never match; add a " ++
+                        "midrPart tiebreak or an explicit match to separate them",
+                    .{ a.cfg.name, b.cfg.name },
+                );
+            }
+        }
+    }
+}
+
+fn conditionsEql(a: []const format.Condition, b: []const format.Condition) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.source != y.source or x.mask != y.mask or x.expected != y.expected) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Translate config matches into wire conditions. Every failure is a
@@ -506,6 +640,33 @@ fn elfCheck(path: []const u8, bytes: []const u8) error{NotAnElf}!ElfIdentity {
     };
 }
 
+/// Stream one unique payload file into the output writer, hashing as it
+/// copies. The digest must match the load-time digest — a payload that
+/// changed between dedup and write fails the pack instead of shipping
+/// unverified bytes.
+fn streamPayload(io: Io, config_dir: Io.Dir, w: *Io.Writer, ref: PayloadRef) !void {
+    var file = config_dir.openFile(io, ref.path, .{}) catch |err| {
+        logFail(ref.path, "open", err);
+        return err;
+    };
+    defer file.close(io);
+
+    var fr = file.reader(io, &.{});
+    var hasher = Wyhash.init(0);
+    var buf: [32768]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const amt = try fr.interface.readSliceShort(&buf);
+        if (amt == 0) break;
+        hasher.update(buf[0..amt]);
+        try w.writeAll(buf[0..amt]);
+        total += amt;
+    }
+    if (total != ref.size or hasher.final() != ref.digest) {
+        return configFail("{s}: payload changed during pack", .{ref.path});
+    }
+}
+
 fn logFail(path: []const u8, action: []const u8, err: anyerror) void {
     stdio.print(.err, "packer: {s} {s}: {s}", .{ action, path, @errorName(err) });
 }
@@ -555,7 +716,10 @@ pub fn layout(
     cursor += running;
 
     const table_offset = cursor;
-    cursor += @as(u64, payload_lens.len) * @sizeOf(format.VariantEntry) +
+    // NOTE: entries are per-VARIANT (condition_counts.len), not per
+    // unique payload — deduped payloads share offsets but each variant
+    // still owns an entry.
+    cursor += @as(u64, condition_counts.len) * @sizeOf(format.VariantEntry) +
         @sizeOf(format.Footer);
 
     return .{
@@ -572,24 +736,33 @@ fn writeFat(
     io: Io,
     arena: Allocator,
     dir: Io.Dir,
+    config_dir: Io.Dir,
     out_path: []const u8,
     stub: []const u8,
     machine: u16,
     variants: []const LoadedVariant,
 ) !Layout {
-    const payload_lens = try arena.alloc(u64, variants.len);
+    // One unique-payload slot per distinct byte set; variants with
+    // identical bytes share a slot and its offset.
+    var unique_count: usize = 0;
+    for (variants) |v| unique_count = @max(unique_count, v.payload_index + 1);
+    const unique: []const LoadedVariant = blk: {
+        const u = try arena.alloc(LoadedVariant, unique_count);
+        for (variants) |v| u[v.payload_index] = v;
+        break :blk u;
+    };
+
+    const payload_lens = try arena.alloc(u64, unique_count);
     const condition_counts = try arena.alloc(u32, variants.len);
-    for (variants, 0..) |v, i| {
-        payload_lens[i] = v.payload.len;
-        condition_counts[i] = @intCast(v.conditions.len);
-    }
+    for (unique, 0..) |v, i| payload_lens[i] = v.payload.size;
+    for (variants, 0..) |v, i| condition_counts[i] = @intCast(v.conditions.len);
     const lay = try layout(arena, stub.len, payload_lens, condition_counts);
 
     const entries = try arena.alloc(format.VariantEntry, variants.len);
     for (variants, 0..) |v, i| {
         entries[i] = .{
-            .payload_offset = lay.payload_offsets[i],
-            .payload_size = v.payload.len,
+            .payload_offset = lay.payload_offsets[v.payload_index],
+            .payload_size = v.payload.size,
             .condition_offset = lay.condition_offsets[i],
             .condition_count = @intCast(v.conditions.len),
             .is_default = if (v.cfg.match.len == 0) 1 else 0,
@@ -619,10 +792,10 @@ fn writeFat(
     // Each pad is < page_size: alignForward rounds up by at most one page.
     const zero_page: [format.page_size]u8 = @splat(0);
     var cursor: u64 = stub.len;
-    for (variants, 0..) |v, i| {
+    for (unique, 0..) |v, i| {
         try w.writeAll(zero_page[0..@intCast(lay.payload_offsets[i] - cursor)]);
-        try w.writeAll(v.payload);
-        cursor = lay.payload_offsets[i] + v.payload.len;
+        try streamPayload(io, config_dir, w, v.payload);
+        cursor = lay.payload_offsets[i] + v.payload.size;
     }
     for (variants) |v| {
         for (v.conditions) |c| {
@@ -833,6 +1006,100 @@ test "elfCheck: machine + program-ness" {
     try testing.expectError(error.NotAnElf, elfCheck("payload", &not_elf));
 }
 
+test "writeFat: dedups identical payload bytes" {
+    const io = testing.io;
+    stdio.init(io);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const e_type_off = @offsetOf(elf.Elf64_Ehdr, "e_type");
+    const e_machine_off = @offsetOf(elf.Elf64_Ehdr, "e_machine");
+    const e_entry_off = @offsetOf(elf.Elf64_Ehdr, "e_entry");
+    var payload: [64]u8 = @splat(0xCC);
+    payload[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
+    format.writeInt(u16, payload[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
+    format.writeInt(u16, payload[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u64, payload[e_entry_off..][0..8], 0x1000);
+
+    var payload_other: [64]u8 = @splat(0xDD);
+    payload_other[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
+    format.writeInt(u16, payload_other[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
+    format.writeInt(u16, payload_other[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u64, payload_other[e_entry_off..][0..8], 0x1000);
+
+    // Write the payloads to real files — writeFat streams from paths.
+    try tmp.dir.writeFile(io, .{ .sub_path = "same", .data = &payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other", .data = &payload_other });
+    const same_ref: PayloadRef = .{
+        .path = "same",
+        .size = payload.len,
+        .digest = Wyhash.hash(0, &payload),
+    };
+    const other_ref: PayloadRef = .{
+        .path = "other",
+        .size = payload_other.len,
+        .digest = Wyhash.hash(0, &payload_other),
+    };
+
+    // Two variants pointing at identical bytes plus one distinct.
+    const loaded = [_]LoadedVariant{
+        .{
+            .cfg = .{ .name = "a", .binary = "same", .match = &.{} },
+            .payload = same_ref,
+            .payload_index = 0,
+            .conditions = &.{},
+        },
+        .{
+            .cfg = .{ .name = "b", .binary = "same", .match = &.{} },
+            .payload = same_ref,
+            .payload_index = 0,
+            .conditions = &.{},
+        },
+        .{
+            .cfg = .{ .name = "c", .binary = "other", .match = &.{} },
+            .payload = other_ref,
+            .payload_index = 1,
+            .conditions = &.{},
+        },
+    };
+
+    const lay = try writeFat(
+        io,
+        arena,
+        tmp.dir,
+        tmp.dir,
+        "fat.bin",
+        &payload,
+        @intFromEnum(elf.EM.AARCH64),
+        &loaded,
+    );
+    var arena2: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena2.deinit();
+    const fat = try readFile(io, arena2.allocator(), tmp.dir, "fat.bin");
+
+    const footer = try format.findFooter(fat);
+    try testing.expectEqual(@as(u32, 3), footer.variant_count);
+    // Entries a and b share the offset; c is distinct.
+    const entry_a = try format.decode(format.VariantEntry, fat[@intCast(footer.table_offset)..]);
+    const entry_b_at: usize = @intCast(footer.table_offset + 32);
+    const entry_b = try format.decode(format.VariantEntry, fat[entry_b_at..]);
+    const entry_c_at: usize = @intCast(footer.table_offset + 64);
+    const entry_c = try format.decode(format.VariantEntry, fat[entry_c_at..]);
+    try testing.expectEqual(entry_a.payload_offset, entry_b.payload_offset);
+    try testing.expect(entry_c.payload_offset != entry_a.payload_offset);
+
+    // The size accounts TWO unique payloads, not three: no variant's
+    // payload_size may grow the file past lay.size.
+    const stat = try tmp.dir.statFile(io, "fat.bin", .{});
+    try testing.expectEqual(lay.size, stat.size);
+    // Unique payload slots: 4096 (stub 64 padded) + 64 + 4096 + 64,
+    // table + footer + entries only.
+    try testing.expect(lay.size < 4096 + 64 + 4096 + 64 + 3 * 32 + 32 + 4096);
+}
+
 test "writeFat: two-variant round-trip through a real file" {
     const io = testing.io;
     stdio.init(io);
@@ -859,10 +1126,25 @@ test "writeFat: two-variant round-trip through a real file" {
     format.writeInt(u64, payload_1[e_entry_off..][0..8], 0x1000);
 
     const machine = @intFromEnum(elf.EM.AARCH64);
+    // Payloads by reference — writeFat streams from files, so write the
+    // bytes out and reference them.
+    try tmp.dir.writeFile(io, .{ .sub_path = "p0", .data = &payload_0 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "p1", .data = &payload_1 });
+    const p0_ref: PayloadRef = .{
+        .path = "p0",
+        .size = payload_0.len,
+        .digest = Wyhash.hash(0, &payload_0),
+    };
+    const p1_ref: PayloadRef = .{
+        .path = "p1",
+        .size = payload_1.len,
+        .digest = Wyhash.hash(0, &payload_1),
+    };
     const loaded = [_]LoadedVariant{
         .{
             .cfg = .{ .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }} },
-            .payload = &payload_0,
+            .payload = p0_ref,
+            .payload_index = 0,
             .conditions = try compileMatches(arena, .{
                 .name = "v2",
                 .binary = "p0",
@@ -871,12 +1153,13 @@ test "writeFat: two-variant round-trip through a real file" {
         },
         .{
             .cfg = .{ .name = "generic", .binary = "p1", .match = &.{} },
-            .payload = &payload_1,
+            .payload = p1_ref,
+            .payload_index = 1,
             .conditions = &.{},
         },
     };
 
-    const lay = try writeFat(io, arena, tmp.dir, "fat.bin", &stub, machine, &loaded);
+    const lay = try writeFat(io, arena, tmp.dir, tmp.dir, "fat.bin", &stub, machine, &loaded);
     const stat = try tmp.dir.statFile(io, "fat.bin", .{});
     try testing.expectEqual(lay.size, stat.size);
     try testing.expect(stat.permissions.toMode() & 0o111 != 0);

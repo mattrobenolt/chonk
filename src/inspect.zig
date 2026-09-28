@@ -47,14 +47,30 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
         const at: usize = @intCast(footer.table_offset + i * @sizeOf(format.VariantEntry));
         const entry = try format.decode(format.VariantEntry, fat[at..]);
 
+        // Dedup is visible right here: identical payload bytes share an
+        // offset. Annotate repeats.
+        var shared = false;
+        for (0..i) |j| {
+            const prev_at: usize = @intCast(footer.table_offset + j * @sizeOf(format.VariantEntry));
+            const prev = try format.decode(format.VariantEntry, fat[prev_at..]);
+            if (prev.payload_offset == entry.payload_offset and
+                prev.payload_size == entry.payload_size) shared = true;
+        }
         const fallback = if (entry.is_default != 0 or entry.condition_count == 0)
             ", fallback"
         else
             "";
         stdio.print(
             .out,
-            "  {d}: payload @ {d} ({d} bytes, {d} condition(s){s})",
-            .{ i, entry.payload_offset, entry.payload_size, entry.condition_count, fallback },
+            "  {d}: payload @ {d} ({d} bytes, {d} condition(s){s}{s})",
+            .{
+                i,
+                entry.payload_offset,
+                entry.payload_size,
+                entry.condition_count,
+                fallback,
+                if (shared) ", shared" else "",
+            },
         );
 
         // Conditions: count records at condition_offset, ending before the
