@@ -322,9 +322,18 @@ in order of preference:
   answered `unknown program 'fat'`). If such payloads matter, the config
   needs a per-variant `argv[0]` override the stub substitutes at exec
   time; ordinary payloads ignore argv[0] entirely.
-- How to encode CPUID conditions (leaf/subleaf/register/bit) into the
-  existing `Condition` mask/expected pair — x86 needs a richer vocabulary
-  than aarch64's hwcap mask.
+- How to encode CPUID conditions into the existing `Condition` — RESOLVED
+  (step 8): `source = cpuid` with `mask` transporting
+  `(leaf << 32) | subleaf` and `expected` transporting
+  `(register << 5) | bit`; the bit must be set. The ZON config writes it as
+  `.{ .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } }` (AVX2); the
+  build API infers it from Zig x86_64 target features (the psABI-level
+  set). Verified end to end under qemu-user to the emulation boundary:
+  condition evaluation + both selection paths proven via strace (the v3
+  payload selected when qemu advertises AVX2, the baseline when stripped);
+  the final execveat hands the guest ELF to the host kernel, which refuses
+  a foreign-arch exec — an emulation wall, not a chonk one. Full dispatch
+  needs real x86_64 hardware or binfmt_misc.
 - Max payload size we're comfortable reading fully into memory vs. when
   streaming into the memfd becomes worth the complexity.
 - Whether we ever want more than AND-of-conditions-per-variant match logic —

@@ -18,16 +18,24 @@ pub const format_version: u32 = 1;
 /// possible later — mmap requires page-aligned file offsets.
 pub const page_size = 4096;
 
-/// Where a condition reads its value from.
+/// Where a condition reads its value from. Per-source semantics:
+///
+///  - `hwcap`/`hwcap2`: `(value & mask) == expected`, value from the
+///    auxv word.
+///  - `cpuid` (x86_64): `mask` transports `(leaf << 32) | subleaf`,
+///    `expected` transports `(register << 5) | bit`; the bit must be set.
+///  - `midr`: reserved — the packer rejects it until the stub learns to
+///    read it (direction.md step 7).
 pub const Source = enum(u8) {
     /// `AT_HWCAP` (auxv type 16).
     hwcap = 0,
     /// `AT_HWCAP2` (auxv type 26).
     hwcap2 = 1,
     /// `MIDR_EL1`, readable at EL0 — Linux traps and emulates this read.
-    /// Reserved: the packer rejects it until the stub learns to read it
-    /// (direction.md step 7).
     midr = 2,
+    /// x86_64 `CPUID` — unprivileged, read directly by the stub. Transport
+    /// encoding in the enum doc above.
+    cpuid = 3,
 };
 
 /// Fixed footer, always the last `@sizeOf(Footer)` bytes of the file.

@@ -19,9 +19,10 @@ pub const Match = pack.Match;
 pub const Bit = pack.Bit;
 
 const aarch64 = std.Target.aarch64;
+const x86 = std.Target.x86;
 
-/// Bit → the Zig target feature that implies it, where one exists. The
-/// kernel vocabulary is finer-grained than LLVM's in three places
+/// Bit → the Zig aarch64 target feature that implies it, where one exists.
+/// The kernel vocabulary is finer-grained than LLVM's in three places
 /// (svepmull, svei8mm, svebf16 have no Zig feature) — those stay
 /// explicit-only (the ZON config's raw form).
 fn zigFeature(bit: Bit) ?aarch64.Feature {
@@ -41,20 +42,67 @@ fn zigFeature(bit: Bit) ?aarch64.Feature {
     };
 }
 
-/// Infer the dispatch conditions from a target: every inferable bit whose
-/// feature the target has and the arch baseline lacks.
-fn inferBits(b: *Build, target: std.Target) []const Bit {
+/// Zig x86_64 feature → the CPUID (leaf, subleaf, register, bit) that
+/// advertises it, curated to the psABI-level-defining set (x86-64
+/// v2/v3/v4). Locations pinned from the x86-64 psABI / Intel SDM.
+fn cpuidSpec(feature: x86.Feature) ?pack.Cpuid {
+    return switch (feature) {
+        // CPUID.1H:ECX
+        .ssse3 => .{ .leaf = 1, .register = .ecx, .bit = 9 },
+        .cx16 => .{ .leaf = 1, .register = .ecx, .bit = 13 },
+        .sse4_1 => .{ .leaf = 1, .register = .ecx, .bit = 19 },
+        .sse4_2 => .{ .leaf = 1, .register = .ecx, .bit = 20 },
+        .fma => .{ .leaf = 1, .register = .ecx, .bit = 12 },
+        .movbe => .{ .leaf = 1, .register = .ecx, .bit = 22 },
+        .popcnt => .{ .leaf = 1, .register = .ecx, .bit = 23 },
+        .aes => .{ .leaf = 1, .register = .ecx, .bit = 25 },
+        .avx => .{ .leaf = 1, .register = .ecx, .bit = 28 },
+        .f16c => .{ .leaf = 1, .register = .ecx, .bit = 29 },
+        // CPUID.7H.0H:EBX
+        .bmi => .{ .leaf = 7, .register = .ebx, .bit = 3 },
+        .avx2 => .{ .leaf = 7, .register = .ebx, .bit = 5 },
+        .bmi2 => .{ .leaf = 7, .register = .ebx, .bit = 8 },
+        .avx512f => .{ .leaf = 7, .register = .ebx, .bit = 16 },
+        .avx512dq => .{ .leaf = 7, .register = .ebx, .bit = 17 },
+        .avx512cd => .{ .leaf = 7, .register = .ebx, .bit = 28 },
+        .avx512bw => .{ .leaf = 7, .register = .ebx, .bit = 30 },
+        .avx512vl => .{ .leaf = 7, .register = .ebx, .bit = 31 },
+        // CPUID.80000001H:ECX
+        .sahf => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 0 },
+        .lzcnt => .{ .leaf = 0x8000_0001, .register = .ecx, .bit = 5 },
+        else => null,
+    };
+}
+
+/// Infer the dispatch conditions from a target: every inferable condition
+/// whose feature the target has and the arch baseline lacks. aarch64
+/// yields named hwcap bits; x86_64 yields CPUID feature tests.
+fn inferMatches(b: *Build, target: std.Target) []const pack.Match {
     const cpu = target.cpu;
     const baseline = std.Target.Cpu.baseline(cpu.arch, target.os);
-    var bits: std.ArrayList(Bit) = .empty;
-    inline for (comptime std.enums.values(Bit)) |bit| {
-        if (zigFeature(bit)) |feature| {
-            if (cpu.has(.aarch64, feature) and !baseline.has(.aarch64, feature)) {
-                bits.append(b.allocator, bit) catch @panic("OOM");
+    var matches: std.ArrayList(pack.Match) = .empty;
+    switch (cpu.arch) {
+        .aarch64 => {
+            inline for (comptime std.enums.values(Bit)) |bit| {
+                if (zigFeature(bit)) |feature| {
+                    if (cpu.has(.aarch64, feature) and !baseline.has(.aarch64, feature)) {
+                        matches.append(b.allocator, .{ .bit = bit }) catch @panic("OOM");
+                    }
+                }
             }
-        }
+        },
+        .x86_64 => {
+            inline for (comptime std.enums.values(x86.Feature)) |feature| {
+                if (cpuidSpec(feature)) |c| {
+                    if (cpu.has(.x86, feature) and !baseline.has(.x86, feature)) {
+                        matches.append(b.allocator, .{ .cpuid = c }) catch @panic("OOM");
+                    }
+                }
+            }
+        },
+        else => @panic("chonk.addExecutable: unsupported arch (aarch64, x86_64)"),
     }
-    return bits.toOwnedSlice(b.allocator) catch @panic("OOM");
+    return matches.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
 /// The fallback target: identical to the arch baseline. `.{ .target = .{} }`
@@ -64,10 +112,22 @@ fn inferBits(b: *Build, target: std.Target) []const Bit {
 fn isBaseline(target: std.Target) bool {
     const cpu = target.cpu;
     const baseline = std.Target.Cpu.baseline(cpu.arch, target.os);
-    inline for (comptime std.enums.values(aarch64.Feature)) |feature| {
-        if (cpu.has(.aarch64, feature) != baseline.has(.aarch64, feature)) {
-            return false;
-        }
+    switch (cpu.arch) {
+        .aarch64 => {
+            inline for (comptime std.enums.values(aarch64.Feature)) |feature| {
+                if (cpu.has(.aarch64, feature) != baseline.has(.aarch64, feature)) {
+                    return false;
+                }
+            }
+        },
+        .x86_64 => {
+            inline for (comptime std.enums.values(x86.Feature)) |feature| {
+                if (cpu.has(.x86, feature) != baseline.has(.x86, feature)) {
+                    return false;
+                }
+            }
+        },
+        else => return false,
     }
     return true;
 }
@@ -112,25 +172,36 @@ pub const ExecutableOptions = struct {
 /// One fat binary per architecture: the trailer's machine field is a
 /// species check, so call once per arch with that arch's targets.
 pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
-    // Resolve every target; infer its dispatch bits; find the fallback.
+    // Resolve every target; infer its dispatch conditions; find the
+    // fallback. Every target must be one species — one fat binary per
+    // architecture.
+    var species: ?std.Target.Cpu.Arch = null;
     const targets = b.allocator.alloc(ResolvedTarget, options.targets.len) catch @panic("OOM");
     var fallback_count: usize = 0;
     for (options.targets, 0..) |query, i| {
         const resolved = b.resolveTargetQuery(query);
-        const bits = inferBits(b, resolved.result);
+        if (species) |s| {
+            if (resolved.result.cpu.arch != s) {
+                @panic("chonk.addExecutable: one fat binary per architecture — " ++
+                    "split mixed-arch target lists into one call per arch");
+            }
+        } else {
+            species = resolved.result.cpu.arch;
+        }
+        const match = inferMatches(b, resolved.result);
         const fallback = isBaseline(resolved.result);
         if (fallback) {
             fallback_count += 1;
-        } else if (bits.len == 0) {
+        } else if (match.len == 0) {
             @panic(b.fmt(
-                "chonk.addExecutable: target '{s}' maps to no hwcap bit",
+                "chonk.addExecutable: target '{s}' maps to no dispatchable feature",
                 .{resolved.result.cpu.model.name},
             ));
         }
         targets[i] = .{
             .name = resolved.result.cpu.model.name,
             .resolved = resolved,
-            .bits = bits,
+            .match = match,
             .fallback = fallback,
         };
     }
@@ -153,18 +224,20 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         });
     }
 
-    // The freestanding stub, compiled into THIS build graph from source.
-    // Compiled-once-forever: always ReleaseSmall + stripped, regardless of
-    // the consumer's optimize setting.
+    // The freestanding stub for THIS species, compiled into THIS build
+    // graph from source. Compiled-once-forever: always ReleaseSmall +
+    // stripped, regardless of the consumer's optimize setting.
     const dep = b.dependency("chonk", .{});
+    const stub_target: std.Target.Query = switch (species.?) {
+        .aarch64 => .{ .cpu_arch = .aarch64, .os_tag = .freestanding },
+        .x86_64 => .{ .cpu_arch = .x86_64, .os_tag = .freestanding },
+        else => @panic("chonk.addExecutable: unsupported arch"),
+    };
     const stub = b.addExecutable(.{
         .name = "stub",
         .root_module = b.createModule(.{
             .root_source_file = dep.path("src/stub.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .freestanding,
-            }),
+            .target = b.resolveTargetQuery(stub_target),
             .optimize = .ReleaseSmall,
             .strip = true,
             .single_threaded = true,
@@ -178,7 +251,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         inputs[i] = .{
             .name = t.name,
             .payload = exes[i].getEmittedBin(),
-            .bits = t.bits,
+            .match = t.match,
         };
     }
     pack_step.* = .{
@@ -217,9 +290,28 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
 const ResolvedTarget = struct {
     name: []const u8,
     resolved: std.Build.ResolvedTarget,
-    bits: []const Bit,
+    match: []const pack.Match,
     fallback: bool,
 };
+
+/// Hash one match into a manifest — the match's full meaning, so a
+/// condition change re-packs.
+fn hashMatch(man: *Build.Cache.Manifest, m: pack.Match) void {
+    if (m.bit) |bit| {
+        man.hash.addBytes(@tagName(bit));
+    } else if (m.cpuid) |c| {
+        man.hash.add(c.leaf);
+        man.hash.add(c.subleaf);
+        man.hash.add(@intFromEnum(c.register));
+        man.hash.add(c.bit);
+    } else if (m.source) |source| {
+        man.hash.add(@intFromEnum(source));
+        if (m.mask) |mask| man.hash.add(mask);
+        if (m.expected) |expected| man.hash.add(expected);
+    } else {
+        man.hash.addBytes("(unconditional)");
+    }
+}
 
 const PackStep = struct {
     step: Step,
@@ -232,7 +324,7 @@ const PackStep = struct {
         name: []const u8,
         payload: LazyPath,
         /// Empty = the fallback.
-        bits: []const Bit,
+        match: []const pack.Match,
     };
 
     fn make(step: *Step, options: Step.MakeOptions) anyerror!void {
@@ -249,8 +341,8 @@ const PackStep = struct {
         _ = try man.addFilePath(self.stub.getPath3(b, step), null);
         for (self.inputs) |input| {
             man.hash.addBytes(input.name);
-            for (input.bits) |bit| {
-                man.hash.addBytes(@tagName(bit));
+            for (input.match) |m| {
+                hashMatch(&man, m);
             }
             man.hash.addBytes("(end)");
             _ = try man.addFilePath(input.payload.getPath3(b, step), null);
@@ -278,14 +370,10 @@ const PackStep = struct {
         const cwd = Io.Dir.cwd();
         const variants = try arena.alloc(pack.Variant, self.inputs.len);
         for (self.inputs, 0..) |input, i| {
-            const match = try arena.alloc(pack.Match, input.bits.len);
-            for (input.bits, 0..) |bit, j| {
-                match[j] = .{ .bit = bit };
-            }
             variants[i] = .{
                 .name = input.name,
                 .binary = input.payload.getPath2(b, step),
-                .match = match,
+                .match = input.match,
             };
         }
         _ = try pack.packAll(io, arena, cwd, cwd, self.fat.path.?, stub_path, .{

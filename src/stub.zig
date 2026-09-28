@@ -6,16 +6,22 @@
 //!
 //! Dispatch semantics: first variant in table order whose conditions all
 //! pass wins (an is_default entry, or one with no conditions, matches
-//! unconditionally); conditions are ANDed against AT_HWCAP/AT_HWCAP2.
+//! unconditionally); conditions AND — aarch64 against AT_HWCAP/AT_HWCAP2,
+//! x86_64 against CPUID (unprivileged, read directly).
 
 const std = @import("std");
 const linux = std.os.linux;
 const elf = std.elf;
+const builtin = @import("builtin");
 
 const format = @import("format.zig");
 
-/// This stub's species — the x86_64 twin switches this at comptime.
-const my_machine: u16 = @intFromEnum(elf.EM.AARCH64);
+/// This stub's species — selected at comptime by the build target.
+const my_machine: u16 = switch (builtin.cpu.arch) {
+    .aarch64 => @intFromEnum(elf.EM.AARCH64),
+    .x86_64 => @intFromEnum(elf.EM.X86_64),
+    else => @compileError("chonk stub: unsupported arch"),
+};
 
 /// Kernel entry point. `callconv(.naked)` = the compiler emits ONLY this
 /// asm, no prologue, so sp still points at the initial stack block the
@@ -24,20 +30,52 @@ const my_machine: u16 = @intFromEnum(elf.EM.AARCH64);
 ///   [argc: u64][argv[0..argc]: u64 ptrs][NULL][envp: u64 ptrs][NULL]
 ///   [auxv: (a_type, a_val) u64 pairs...][AT_NULL, 0]
 ///
-/// Mirrors std.start's aarch64 entry: zero fp/lr (this is the first
-/// userspace frame — unwinder hygiene), pass the ORIGINAL sp in x0,
-/// realign sp to 16, tail-branch into Zig code.
+/// Both arms mirror std.start's entries verbatim: zero the frame pointer
+/// (this is the first userspace frame — unwinder hygiene), pass the
+/// ORIGINAL sp as the first argument, realign sp to 16, and never come
+/// back (aarch64 tail-branches; x86_64 calls — both arms are one-way).
 export fn _start() callconv(.naked) noreturn {
-    asm volatile (
-        \\ mov fp, #0
-        \\ mov lr, #0
-        \\ mov x0, sp
-        \\ and sp, x0, #-16
-        \\ b %[walk]
-        :
-        : [_start] "X" (&_start), // self-reference: forces emission
-          [walk] "X" (&walk),
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile (
+            \\ mov fp, #0
+            \\ mov lr, #0
+            \\ mov x0, sp
+            \\ and sp, x0, #-16
+            \\ b %[walk]
+            :
+            : [_start] "X" (&_start), // self-reference: forces emission
+              [walk] "X" (&walk),
+        ),
+        .x86_64 => asm volatile (
+            \\ xorl %%ebp, %%ebp
+            \\ movq %%rsp, %%rdi
+            \\ andq $-16, %%rsp
+            \\ callq %[walk:P]
+            :
+            : [_start] "X" (&_start),
+              [walk] "X" (&walk),
+        ),
+        else => @compileError("chonk stub: unsupported arch"),
+    }
+}
+
+/// Read CPUID — x86_64 only. One instruction, no privileges needed; the
+/// kernel is not involved, which is the whole difference from aarch64's
+/// auxv-mediated detection.
+fn readCpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (subleaf),
     );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
 /// Walk the initial stack (x0 = the original sp), then dispatch.
@@ -157,12 +195,34 @@ fn matches(
         const condition = format.decode(format.Condition, &cond_bytes) catch
             fatal("condition does not decode");
 
-        const value = switch (condition.source) {
-            .hwcap => hwcap,
-            .hwcap2 => hwcap2,
+        // Per-source semantics (see format.Source). hwcap/hwcap2 compare
+        // an auxv word; cpuid transports (leaf, subleaf, register, bit) and
+        // tests the bit.
+        const ok = switch (condition.source) {
+            .hwcap => (hwcap & condition.mask) == condition.expected,
+            .hwcap2 => (hwcap2 & condition.mask) == condition.expected,
+            .cpuid => blk: {
+                // Comptime-gated: the x86 asm is never analyzed on aarch64.
+                if (builtin.cpu.arch == .x86_64) {
+                    const leaf: u32 = @truncate(condition.mask >> 32);
+                    const subleaf: u32 = @truncate(condition.mask);
+                    const reg: u8 = @truncate(condition.expected >> 5);
+                    const bit: u5 = @truncate(condition.expected);
+                    const r = readCpuid(leaf, subleaf);
+                    const word: u32 = switch (reg) {
+                        0 => r.eax,
+                        1 => r.ebx,
+                        2 => r.ecx,
+                        3 => r.edx,
+                        else => fatal("cpuid condition has a bad register"),
+                    };
+                    break :blk (word >> bit) & 1 == 1;
+                }
+                fatal("cpuid condition on a non-x86_64 stub");
+            },
             .midr => fatal("this stub does not read MIDR_EL1 yet"),
         };
-        if ((value & condition.mask) != condition.expected) return false;
+        if (!ok) return false;
     }
     return true;
 }

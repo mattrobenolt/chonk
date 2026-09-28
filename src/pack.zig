@@ -61,6 +61,23 @@ pub const Match = struct {
     source: ?format.Source = null,
     mask: ?u64 = null,
     expected: ?u64 = null,
+    /// x86_64 form: the CPUID leaf/subleaf/register/bit that must be set.
+    /// Excludes everything above.
+    cpuid: ?Cpuid = null,
+};
+
+/// One CPUID feature-present test (x86_64).
+pub const Cpuid = struct {
+    /// CPUID leaf (EAX input).
+    leaf: u32,
+    /// CPUID subleaf (ECX input), where the leaf uses one.
+    subleaf: u32 = 0,
+    /// Which output register carries the bit.
+    register: Register,
+    /// The bit, 0-31, that must be set.
+    bit: u5,
+
+    pub const Register = enum(u8) { eax, ebx, ecx, edx };
 };
 
 // ---------------------------------------------------------------------------
@@ -256,7 +273,21 @@ fn loadVariants(
 fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
     const out = try arena.alloc(format.Condition, v.match.len);
     for (v.match, 0..) |m, i| {
-        if (m.bit) |bit| {
+        if (m.cpuid) |c| {
+            if (m.bit != null or m.source != null or m.mask != null or m.expected != null) {
+                return configFail(
+                    "variant '{s}': cpuid form excludes bit/source/mask/expected",
+                    .{v.name},
+                );
+            }
+            // Transport: mask = (leaf << 32) | subleaf,
+            // expected = (register << 5) | bit. The stub requires the bit set.
+            out[i] = .{
+                .mask = (@as(u64, c.leaf) << 32) | c.subleaf,
+                .expected = (@as(u64, @intFromEnum(c.register)) << 5) | c.bit,
+                .source = .cpuid,
+            };
+        } else if (m.bit) |bit| {
             if (m.source != null or m.mask != null or m.expected != null) {
                 return configFail(
                     "variant '{s}': bit form excludes source/mask/expected",
