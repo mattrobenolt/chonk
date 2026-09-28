@@ -1,10 +1,10 @@
 <p align="center"><img src="chonk.svg" alt="chonk" width="620"></p>
 
 A fat binary dispatcher for Linux. A fat binary is one executable file that
-contains several builds of the same program. The running CPU picks the
-payload at exec time. Think of a macOS universal binary, built for Linux
-from scratch — with no libc, no IFUNC, and no dynamic linker in the dispatch
-path.
+contains several builds of the same program, and the running CPU picks
+the payload at exec time. Think of a macOS universal binary, built for
+Linux from scratch, with no libc, no IFUNC, and no dynamic linker in the
+dispatch path.
 
 The front of the file is a freestanding stub. It walks the initial stack,
 reads the CPU features, picks the first variant whose conditions pass, and
@@ -36,7 +36,9 @@ At startup, the stub does this:
 
 The release stub fits in the first three pages of the file. It issues raw
 syscalls only: `openat`, `lseek`, `pread64`, `memfd_create`, `sendfile`,
-`execveat`.
+and `execveat`. On aarch64 the detection values come from the auxv; on
+x86_64 the stub reads CPUID itself. Both arms of the entry are copied
+verbatim from Zig's own startup code, per architecture.
 
 One fat binary serves one architecture. The footer stores the ELF
 `e_machine` value, and the stub validates this value before it trusts the
@@ -72,10 +74,10 @@ lists the CPU models. These are the only things that vary per variant. A
 target entry can also carry an explicit `match` to override the condition
 inference, for silicon chonk has not heard of.
 
-For builds with dependencies, linked libraries, or compile options, set
-`make_exe` instead of `root_source_file`. chonk calls it once per variant
-with the variant's resolved target; wire imports and options exactly as
-the normal build does, and name the executable `v.name`:
+For builds with dependencies or compile options, set `make_exe` instead
+of `root_source_file`. chonk calls it once per variant with the
+variant's resolved target; wire imports exactly as the normal build
+does, and name the executable `v.name`:
 
 ```zig
 fn makeExe(b: *Build, v: chonk.Variant) *Build.Step.Compile {
@@ -150,6 +152,8 @@ number.
     } },
     // Raw form, for anything the enum does not name:
     //   .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 }
+    // CPUID form (x86_64):
+    //   .{ .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } }
     .{ .binary = "build/app-generic" }, // the fallback: no match
 } }
 ```
@@ -171,28 +175,32 @@ Condition sources: `hwcap` and `hwcap2` compare an auxv word against
 same-hwcap silicon (`pack.midrPart(implementer, part)` builds the common
 form).
 
+Identical payload bytes are stored once — entries may share
+`payload_offset`. The packer never holds payloads resident: sizes come
+from stat, ELF checks from a positioned 64-byte header read, and the copy
+streams in 32 KB chunks with a digest check, so a payload that changes
+mid-pack fails instead of shipping.
+
 The stub validates magic, version, and machine before it trusts any
 offset. The format is young, and a change bumps `format_version`; old
 stubs refuse new trailers at run time.
 
 ## Requirements
 
-- Zig 0.16.0
+- Zig 0.16.0 (`nix develop` supplies it)
 - Linux, aarch64 or x86_64
 
 ## Development
 
-From the repository root:
+`nix develop` supplies Zig 0.16, `just`, and qemu-user. `just` runs the
+full e2e battery for whatever host it runs on: both pack doors, the qemu
+tier matrix, the make_exe factory, and the error paths. `just e2e-x86`
+runs the x86_64 legs natively on an x86_64 host; elsewhere those legs
+skip. CI runs both species on every push, an `ubuntu-24.04-arm` job and
+an `ubuntu-24.04` job, so a full native dispatch on each architecture is
+verified continuously.
 
-- `zig build` — build the CLI and both stubs (`stub-aarch64`,
-  `stub-x86_64`).
-- `zig build test` — run the tests.
-- `ziglint src/ build.zig` — lint.
-- `cd examples/consumer && zig build chonk` — build the example release
-  fleet.
-
-The devshell provides qemu-user. Use `-cpu` models to verify dispatch
-under controlled CPU identities:
+Use `-cpu` models to verify dispatch under controlled CPU identities:
 
 ```console
 $ qemu-aarch64 -cpu neoverse-v1 ./zig-out/bin/app  # SVE, no SVE2
@@ -201,8 +209,8 @@ $ qemu-aarch64 -cpu cortex-a72 ./zig-out/bin/app   # no SVE
 
 A cross-architecture `execveat` under qemu-user reaches the host kernel,
 so an emulated x86_64 payload cannot exec from an aarch64 host. The stub
-mechanics still verify under `-strace`, and real x86_64 hardware runs the
-full dispatch.
+mechanics still verify under `-strace`, and CI runs the real dispatch on
+x86_64 hardware.
 
 `direction.md` records the full design history.
 
