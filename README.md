@@ -59,15 +59,37 @@ const fat = chonk.addExecutable(b, .{
     .target = .{ .cpu_arch = .aarch64, .abi = .musl },
     .optimize = optimize,
     .targets = &.{
-        .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
-        .{ .explicit = &Target.aarch64.cpu.neoverse_v1 },
+        .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
+        .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v1 } },
+        .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_n1 } },
         // No fallback listed: chonk appends the arch baseline for you.
     },
 });
 ```
 
 `target` is the shared skeleton — architecture, OS, ABI — and `targets`
-lists the CPU models. These are the only things that vary per variant.
+lists the CPU models. These are the only things that vary per variant. A
+target entry can also carry an explicit `match` to override the condition
+inference, for silicon chonk has not heard of.
+
+For builds with dependencies, linked libraries, or compile options, set
+`make_exe` instead of `root_source_file`. chonk calls it once per variant
+with the variant's resolved target; wire imports and options exactly as
+the normal build does, and name the executable `v.name`:
+
+```zig
+fn makeExe(b: *Build, v: chonk.Variant) *Build.Step.Compile {
+    const app_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = v.target,
+        .optimize = v.optimize,
+    });
+    app_mod.addImport("my_dep", my_dep.module("my_dep"));
+    const exe = b.addExecutable(.{ .name = v.name, .root_module = app_mod });
+    exe.use_llvm = true;
+    return exe;
+}
+```
 
 The call does the rest:
 
@@ -140,7 +162,8 @@ stubs refuse new trailers at run time.
 
 From the repository root:
 
-- `zig build` — build the CLI and the stub.
+- `zig build` — build the CLI and both stubs (`stub-aarch64`,
+  `stub-x86_64`).
 - `zig build test` — run the tests.
 - `ziglint src/ build.zig` — lint.
 - `cd examples/consumer && zig build chonk` — build the example release
