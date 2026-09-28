@@ -304,8 +304,13 @@ in order of preference:
    in CI. Detection is trivial on x86 (unprivileged CPUID) but the dispatch
    problem (no libc, no dynamic linker) is arch-independent — that's why x86
    still gets the fat binary treatment.
-9. Nice-to-haves: `packer inspect`, streaming payload read instead of
-   whole-file buffering, mmap+exec as a faster alternative dispatch path.
+9. Nice-to-haves: mmap+exec as a faster alternative dispatch path.
+   (DONE, 2026-09-28: `packer inspect`; streaming payload read — payloads
+   are never resident: stat for size, positioned 64-byte ELF header read,
+   streaming Wyhash for dedup, streaming copy with digest verification.
+   Identical payload bytes dedupe to one shared `payload_offset`.)
+   Remaining: positioned-read `inspect` (it still reads the whole fat
+   binary — bounded by the same max, debug tool, low priority).
 
 ---
 
