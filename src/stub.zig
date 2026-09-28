@@ -4,9 +4,9 @@
 //! it — passing the ORIGINAL argv/envp through untouched. No libc, no CRT;
 //! the only kernel calls are raw syscalls.
 //!
-//! v0 semantics: the fat binary carries exactly one variant with no
-//! conditions, so "dispatch" means "use it". Step 6 replaces that with the
-//! real first-match walk over the entry table.
+//! Dispatch semantics: first variant in table order whose conditions all
+//! pass wins (an is_default entry, or one with no conditions, matches
+//! unconditionally); conditions are ANDed against AT_HWCAP/AT_HWCAP2.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -62,23 +62,31 @@ fn walk(argc_argv_ptr: [*]usize) callconv(.c) noreturn {
     // AT_EXECFN points at the kernel's own record of the file it exec'd —
     // the honest way to find ourselves. argv[0] is caller-controlled and
     // readlink("/proc/self/exe") needs /proc mounted; AT_EXECFN needs neither.
-    // (Step 6 will scrape AT_HWCAP/AT_HWCAP2 here again, for conditions.)
+    // HWCAP/HWCAP2 are the CPU's advertised feature words — what conditions
+    // are evaluated against.
     var execfn: ?[*:0]const u8 = null;
+    var hwcap: u64 = 0;
+    var hwcap2: u64 = 0;
     var i: usize = 0;
     while (auxv[i].a_type != elf.AT_NULL) : (i += 1) {
-        if (auxv[i].a_type == elf.AT_EXECFN) {
-            execfn = @ptrFromInt(auxv[i].a_un.a_val);
+        switch (auxv[i].a_type) {
+            elf.AT_EXECFN => execfn = @ptrFromInt(auxv[i].a_un.a_val),
+            elf.AT_HWCAP => hwcap = auxv[i].a_un.a_val,
+            elf.AT_HWCAP2 => hwcap2 = auxv[i].a_un.a_val,
+            else => {},
         }
     }
 
     const path = execfn orelse fatal("no AT_EXECFN in auxv");
-    dispatch(path, argv, envp);
+    dispatch(path, argv, envp, hwcap, hwcap2);
 }
 
 fn dispatch(
     path: [*:0]const u8,
     argv: [*]const ?[*:0]const u8,
     envp: [*]const ?[*:0]const u8,
+    hwcap: u64,
+    hwcap2: u64,
 ) noreturn {
     @setRuntimeSafety(false);
 
@@ -98,21 +106,78 @@ fn dispatch(
     if (footer.magic != format.magic) fatal("bad footer magic — not a chonk binary");
     if (footer.format_version != format.format_version) fatal("unsupported trailer format version");
     if (footer.machine != my_machine) fatal("trailer is for a different machine");
-    if (footer.variant_count != 1) fatal("this stub dispatches exactly one variant");
 
-    // Entry table. Offset sanity first — the trailer is untrusted input;
-    // every arithmetic below leans on these checks.
-    if (footer.table_offset > file_size - @as(u64, @sizeOf(format.VariantEntry)))
+    // Entry table: variant_count entries at table_offset. The trailer is
+    // untrusted — widen the u32 count before any arithmetic.
+    if (@as(u64, footer.variant_count) * @sizeOf(format.VariantEntry) >
+        file_size - @as(u64, @sizeOf(format.Footer)))
+    {
         fatal("entry table out of range");
-    var entry_bytes: [@sizeOf(format.VariantEntry)]u8 = undefined;
-    preadFull(fat_fd, &entry_bytes, @intCast(footer.table_offset));
-    const entry = format.decode(format.VariantEntry, &entry_bytes) catch
-        fatal("entry does not decode");
-    if (entry.condition_count != 0) fatal("this stub does not evaluate conditions yet");
+    }
 
+    // First match wins, in table order. An is_default entry (or one with no
+    // conditions) matches unconditionally — the packer puts the default
+    // last, so it is the catch-all.
+    var entry_index: usize = 0;
+    while (entry_index < footer.variant_count) : (entry_index += 1) {
+        const entry_at = footer.table_offset +
+            entry_index * @sizeOf(format.VariantEntry);
+        var entry_bytes: [@sizeOf(format.VariantEntry)]u8 = undefined;
+        preadFull(fat_fd, &entry_bytes, @intCast(entry_at));
+        const entry = format.decode(format.VariantEntry, &entry_bytes) catch
+            fatal("entry does not decode");
+
+        if (entry.is_default != 0 or entry.condition_count == 0 or
+            matches(fat_fd, footer.table_offset, entry, hwcap, hwcap2))
+        {
+            execVariant(fat_fd, footer.table_offset, entry, argv, envp);
+        }
+    }
+    fatal("no variant matched — malformed trailer (no default?)");
+}
+
+/// Evaluate one variant's conditions against the CPU: ANDed, all must pass.
+fn matches(
+    fat_fd: linux.fd_t,
+    table_offset: u64,
+    entry: format.VariantEntry,
+    hwcap: u64,
+    hwcap2: u64,
+) bool {
+    var cond_index: u32 = 0;
+    while (cond_index < entry.condition_count) : (cond_index += 1) {
+        // Widen before arithmetic — condition_count/offset are untrusted.
+        const cond_at = @as(u64, entry.condition_offset) +
+            @as(u64, cond_index) * @sizeOf(format.Condition);
+        if (cond_at + @sizeOf(format.Condition) > table_offset) {
+            fatal("conditions out of range");
+        }
+        var cond_bytes: [@sizeOf(format.Condition)]u8 = undefined;
+        preadFull(fat_fd, &cond_bytes, @intCast(cond_at));
+        const condition = format.decode(format.Condition, &cond_bytes) catch
+            fatal("condition does not decode");
+
+        const value = switch (condition.source) {
+            .hwcap => hwcap,
+            .hwcap2 => hwcap2,
+            .midr => fatal("this stub does not read MIDR_EL1 yet"),
+        };
+        if ((value & condition.mask) != condition.expected) return false;
+    }
+    return true;
+}
+
+/// Stream `entry`'s payload into a fresh memfd and become it.
+fn execVariant(
+    fat_fd: linux.fd_t,
+    table_offset: u64,
+    entry: format.VariantEntry,
+    argv: [*]const ?[*:0]const u8,
+    envp: [*]const ?[*:0]const u8,
+) noreturn {
     // Payload must fit strictly between its offset and the entry table.
-    if (entry.payload_offset >= footer.table_offset or
-        entry.payload_size > footer.table_offset - entry.payload_offset)
+    if (entry.payload_offset >= table_offset or
+        entry.payload_size > table_offset - entry.payload_offset)
         fatal("payload out of range");
 
     // Stream the payload into a fresh memfd. sendfile does the copying in
@@ -188,11 +253,16 @@ fn fatalSyscall(comptime what: []const u8, rc: usize) noreturn {
 const Writer = struct {
     fd: linux.fd_t,
     buf: []u8,
-    len: usize = 0,
+    len: u8 = 0,
 
     fn append(w: *Writer, s: []const u8) void {
-        @memcpy(w.buf[w.len..][0..s.len], s);
-        w.len += s.len;
+        var buf = w.remaining();
+        @memcpy(buf[0..s.len], s);
+        w.len += @intCast(s.len);
+    }
+
+    fn remaining(w: *Writer) []u8 {
+        return w.buf[w.len..];
     }
 
     fn slice(w: *const Writer) []const u8 {

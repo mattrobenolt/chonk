@@ -339,6 +339,14 @@ fn compileMatches(arena: Allocator, v: Variant) ![]const format.Condition {
             const expected = m.expected orelse {
                 return configFail("variant '{s}': raw match needs an expected", .{v.name});
             };
+            // The stub cannot read MIDR_EL1 yet (step 7) — refuse at pack
+            // time rather than shipping a fat binary that dies at dispatch.
+            if (mem.eql(u8, source_str, "midr")) {
+                return configFail(
+                    "variant '{s}': midr source lands with MIDR_EL1 support (step 7)",
+                    .{v.name},
+                );
+            }
             const source = parseSource(source_str) orelse {
                 return configFail("variant '{s}': unknown source '{s}'", .{ v.name, source_str });
             };
@@ -354,7 +362,6 @@ fn compileMatches(arena: Allocator, v: Variant) ![]const format.Condition {
 fn parseSource(s: []const u8) ?format.Source {
     if (mem.eql(u8, s, "hwcap")) return .hwcap;
     if (mem.eql(u8, s, "hwcap2")) return .hwcap2;
-    if (mem.eql(u8, s, "midr")) return .midr;
     return null;
 }
 
@@ -720,6 +727,11 @@ test "compileMatches: rejects unknown bits and mixed forms" {
     // No form at all.
     try testing.expectError(error.Config, compileMatches(arena, .{
         .name = "v", .binary = "b", .match = &.{.{}},
+    }));
+    // MIDR source is gated until the stub can read it (step 7).
+    try testing.expectError(error.Config, compileMatches(arena, .{
+        .name = "v", .binary = "b",
+        .match = &.{.{ .source = "midr", .mask = 1, .expected = 1 }},
     }));
 }
 

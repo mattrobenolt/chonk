@@ -25,6 +25,8 @@ pub const Source = enum(u8) {
     /// `AT_HWCAP2` (auxv type 26).
     hwcap2 = 1,
     /// `MIDR_EL1`, readable at EL0 — Linux traps and emulates this read.
+    /// Reserved: the packer rejects it until the stub learns to read it
+    /// (direction.md step 7).
     midr = 2,
 };
 
