@@ -1,10 +1,12 @@
-//! Example consumer: a plain Zig project that builds one fat binary out of
-//! the same app compiled for two CPUs. Run with:
+//! Example consumer: the canonical chonk integration.
 //!
-//!     zig build && ./zig-out/bin/app
+//!   zig build          — the normal binary, native CPU (the dev loop)
+//!   zig build run      — run the normal binary
+//!   zig build chonk    — the fat binary (the release build)
 //!
-//! The whole integration is one call: `chonk.addExecutable` with a target
-//! list instead of a single target.
+//! The last one out of zig-out/bin/app is whichever you built: the fat
+//! binary is the release version of the same app, same name, same
+//! interface — it just picks its payload by CPU features at exec time.
 
 const std = @import("std");
 const Build = std.Build;
@@ -15,29 +17,42 @@ const chonk = @import("chonk");
 
 pub fn build(b: *Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const target = b.standardTargetOptions(.{});
 
-    // One app, one name, a list of targets. The neoverse_v2 build
-    // dispatches on the SVE2-family bits implied by its features; the
-    // arch-baseline build is the fallback. Note .{ .cpu_model = .baseline }
-    // — a bare .{} would mean native-on-this-build-machine, which on V2
-    // hardware would build a V2 binary as the "fallback".
+    // The normal binary: plain Zig scaffolding, nothing chonk about it.
+    const exe = b.addExecutable(.{
+        .name = "app",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    // `zig build chonk`: the same app compiled for the target fleet,
+    // packed into one fat binary that dispatches by CPU features.
     const fat = chonk.addExecutable(b, .{
         .name = "app",
         .root_source_file = b.path("src/main.zig"),
         .optimize = optimize,
+        .install = false, // wired into the chonk step below, not the default
         .targets = &.{
             .{ .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
-            .{ .cpu_model = .baseline }, // the fallback
+            .{ .cpu_model = .baseline }, // the fallback — NOT bare .{} (= native)
         },
     });
 
-    // The LazyPath return is a first-class graph citizen: feed it to a run
-    // step and `zig build run` executes the FAT binary — which on this
-    // machine dispatches to the right variant. The dev loop goes through
-    // the front door; the intermediates never need exposing.
-    const run_step = b.step("run", "Run the fat binary");
-    const run_cmd = Build.Step.Run.create(b, "run app");
-    run_cmd.addFileArg(fat);
-    run_step.dependOn(&run_cmd.step);
-    if (b.args) |args| run_cmd.addArgs(args);
+    // addInstallFileWithDir creates the install step but wires nothing —
+    // depending on it from OUR step (not the default install) is what makes
+    // `zig build chonk` the only trigger. The fat binary lands at
+    // zig-out/bin/app, same name as the dev build: last one built wins.
+    const install_fat = b.addInstallFileWithDir(fat, .bin, "app");
+    const chonk_step = b.step("chonk", "Build the fat binary");
+    chonk_step.dependOn(&install_fat.step);
 }

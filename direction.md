@@ -249,8 +249,13 @@ _ = chonk.addExecutable(b, .{
   kernel loads the front ELF as the stub's arch and has no Mach-O-style
   arch pick; call `chonk.addExecutable` once per arch with that arch's
   targets.
-- Working example: `examples/consumer/` — the whole integration is the one
-  call above.
+- Working example: `examples/consumer/` — the canonical pattern:
+  `zig build` = the normal binary (native dev loop, nothing chonk in the
+  graph); `zig build run` runs it; `zig build chonk` builds the fat binary
+  for release, installed as zig-out/bin/app (same name as the dev build —
+  last one built wins). The opt-in wiring: `install = false` +
+  `addInstallFileWithDir` depended on by a `chonk` step instead of the
+  default install step.
 
 ---
 
