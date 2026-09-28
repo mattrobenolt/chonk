@@ -48,7 +48,8 @@ pub fn build(b: *Build) void {
         .install = false, // wired into the chonk step below, not the default
         .targets = &.{
             .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
-            .baseline, // the fallback
+            // no fallback listed — the arch baseline is appended
+            // automatically as the last entry
         },
     });
     const install_arm = b.addInstallFileWithDir(fat_arm, .bin, "app");
@@ -64,7 +65,8 @@ pub fn build(b: *Build) void {
         .install = false,
         .targets = &.{
             .{ .explicit = &Target.x86.cpu.x86_64_v3 },
-            .baseline, // the fallback
+            // no fallback listed — the arch baseline is appended
+            // automatically as the last entry
         },
     });
     const install_x86 = b.addInstallFileWithDir(fat_x86, .bin, "app-x86_64");

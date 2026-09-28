@@ -200,12 +200,21 @@ pub const ExecutableOptions = struct {
 /// One fat binary per species: the skeleton's arch decides, so call once
 /// per arch with that arch's models.
 pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
+    if (options.targets.len == 0) {
+        @panic("chonk.addExecutable: list at least one variant target — " ++
+            "the arch-baseline fallback is appended automatically");
+    }
+
     // Resolve every model onto the shared skeleton; infer its dispatch
     // conditions; find the fallback. The skeleton fixes the species, so
-    // mixed-arch builds are impossible by construction.
-    const targets = b.allocator.alloc(ResolvedTarget, options.targets.len) catch @panic("OOM");
+    // mixed-arch builds are impossible by construction. One slot is held
+    // for the implicit arch-baseline fallback, used when no listed target
+    // is itself the fallback — the baseline is always derivable from the
+    // skeleton, so requiring it explicitly would be ceremony.
+    const targets = b.allocator.alloc(ResolvedTarget, options.targets.len + 1) catch @panic("OOM");
+    var used: usize = 0;
     var fallback_count: usize = 0;
-    for (options.targets, 0..) |model, i| {
+    for (options.targets) |model| {
         if (model == .explicit and options.target.cpu_arch != null) {
             // Model records carry no arch — the tables are namespaced by
             // arch, so scan them and compare pointers. Without this, a
@@ -232,22 +241,36 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
                 .{resolved.result.cpu.model.name},
             ));
         }
-        targets[i] = .{
+        targets[used] = .{
             .name = resolved.result.cpu.model.name,
             .resolved = resolved,
             .match = match,
             .fallback = fallback,
         };
+        used += 1;
     }
-    if (fallback_count != 1) {
-        @panic("chonk.addExecutable: exactly one target must be the arch " ++
-            "baseline (the fallback) — the bare .baseline model");
+    if (fallback_count > 1) {
+        @panic("chonk.addExecutable: at most one baseline target — it is the " ++
+            "fallback; with none listed, the arch baseline is appended automatically");
     }
+    if (fallback_count == 0) {
+        var query = options.target;
+        query.cpu_model = .baseline;
+        const resolved = b.resolveTargetQuery(query);
+        targets[used] = .{
+            .name = resolved.result.cpu.model.name,
+            .resolved = resolved,
+            .match = inferMatches(b, resolved.result),
+            .fallback = true,
+        };
+        used += 1;
+    }
+    const variants = targets[0..used];
 
     // The intermediates: one build per target, auto-named from the CPU
     // model, cache-only, never installed.
-    const exes = b.allocator.alloc(*Step.Compile, targets.len) catch @panic("OOM");
-    for (targets, 0..) |t, i| {
+    const exes = b.allocator.alloc(*Step.Compile, variants.len) catch @panic("OOM");
+    for (variants, 0..) |t, i| {
         exes[i] = b.addExecutable(.{
             .name = t.name,
             .root_module = b.createModule(.{
@@ -282,8 +305,8 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
     stub.entry = .enabled;
 
     const pack_step = b.allocator.create(PackStep) catch @panic("OOM");
-    const inputs = b.allocator.alloc(PackStep.Input, targets.len) catch @panic("OOM");
-    for (targets, 0..) |t, i| {
+    const inputs = b.allocator.alloc(PackStep.Input, variants.len) catch @panic("OOM");
+    for (variants, 0..) |t, i| {
         inputs[i] = .{
             .name = t.name,
             .payload = exes[i].getEmittedBin(),
