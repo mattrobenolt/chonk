@@ -109,6 +109,26 @@ default install. `examples/consumer` shows the full pattern: `zig build`
 builds the normal native binary, and `zig build chonk` builds the release
 fleet.
 
+## Cloud coverage
+
+One call per architecture covers the ARM fleets on AWS, GCP, and Azure:
+
+| Model | Cloud | Separated by |
+|---|---|---|
+| `neoverse_v3` | AWS Graviton5 | `midrPart(0x41, 0xd84)` — the MIDR tiebreak; V3 advertises the same hwcap words as V2 |
+| `neoverse_v2` | AWS Graviton4, GCP Axion | inferred: the SVE2 family |
+| `neoverse_v1` | AWS Graviton3 | inferred: SVE + crypto |
+| `neoverse_n1` | AWS Graviton2, Azure Cobalt 100, Ampere Altra | inferred: base-word crypto (AES, SHA2, CRC32, LSE, ...) |
+| baseline (appended) | AWS Graviton1 (Cortex-A72) + any v8.0 | — |
+
+On x86_64, the psABI tiers do the same: `v4` (AVX-512: Sapphire/Emerald/
+Granite Rapids, EPYC Genoa+) → `v3` (AVX2: Skylake, EPYC Naples–Milan) →
+baseline. `examples/consumer` carries both ladders end to end.
+
+`midrPart` is the tiebreak for same-hwcap silicon: when two microarchitectures
+advertise identical feature words — V3 and V2 do, on many hosts — only the
+part number separates them, and the stub reads `MIDR_EL1` directly.
+
 ## The CLI
 
 ```console
@@ -147,7 +167,9 @@ source of truth for the packer and the stub.
 
 Condition sources: `hwcap` and `hwcap2` compare an auxv word against
 `mask`. `cpuid` transports a leaf, a subleaf, a register, and a bit.
-`midr` is reserved.
+`midr` compares `MIDR_EL1` against `mask` — the part-number tiebreak for
+same-hwcap silicon (`pack.midrPart(implementer, part)` builds the common
+form).
 
 The stub validates magic, version, and machine before it trusts any
 offset. The format is young, and a change bumps `format_version`; old
