@@ -1,0 +1,38 @@
+// Example chonk pack config. Try it:
+//
+//   ./zig-out/bin/chonk pack zig-out/bin/stub example.zon fat && ./fat
+//
+// Variant order IS priority: the first variant whose conditions all pass
+// wins, else the default. Condition evaluation lands with §7 step 6 — until
+// then the stub answers "this stub dispatches exactly one variant".
+.{
+    .variants = .{
+        // Neoverse V2 and friends — the SVE2 extension family.
+        // Bit names imply their source (SVE2 is an AT_HWCAP2 bit); the
+        // packer's table knows, so the config never says "hwcap2".
+        .{
+            .name = "neoverse-v2",
+            .binary = "zig-out/bin/chonk", // swap for your -march build
+            .match = .{
+                .{ .bit = "SVE2" },
+            },
+        },
+
+        // Neoverse V1 — SVE without SVE2. (Any system path works; this one
+        // is NixOS-flavored — use whatever binaries live on your box.)
+        .{
+            .name = "neoverse-v1",
+            .binary = "/run/current-system/sw/bin/true",
+            .match = .{
+                .{ .bit = "SVE" },
+            },
+        },
+
+        // Fallback when nothing above matched. Exactly one per config.
+        .{
+            .name = "generic",
+            .binary = "/run/current-system/sw/bin/true",
+            .default = true,
+        },
+    },
+}
