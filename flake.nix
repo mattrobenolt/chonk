@@ -36,8 +36,8 @@
               zls_0_16
               ziglint
               zigdoc
-              # x86_64 fat binaries run from aarch64 hosts (chonk step 8 testing)
               qemu-user
+              just
             ];
           };
         };
