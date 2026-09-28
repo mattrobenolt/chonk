@@ -308,7 +308,7 @@ fn preadFull(fd: linux.fd_t, buf: []u8, offset: i64) void {
 fn fatal(comptime what: []const u8) noreturn {
     @branchHint(.cold);
     var stderr_buffer: [128]u8 = undefined;
-    var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
+    var w: Writer = .init(linux.STDERR_FILENO, &stderr_buffer);
     w.append("chonk: ");
     w.append(what);
     w.append("\n");
@@ -319,7 +319,7 @@ fn fatal(comptime what: []const u8) noreturn {
 fn fatalSyscall(comptime what: []const u8, rc: usize) noreturn {
     @branchHint(.cold);
     var stderr_buffer: [160]u8 = undefined;
-    var w: Writer = .{ .fd = 2, .buf = &stderr_buffer };
+    var w: Writer = .init(linux.STDERR_FILENO, &stderr_buffer);
     w.append("chonk: ");
     w.append(what);
     w.append(": ");
@@ -335,6 +335,10 @@ const Writer = struct {
     fd: linux.fd_t,
     buf: []u8,
     len: u8 = 0,
+
+    fn init(fd: linux.fd_t, buf: []u8) Writer {
+        return .{ .fd = fd, .buf = buf };
+    }
 
     fn append(w: *Writer, s: []const u8) void {
         var buf = w.remaining();
