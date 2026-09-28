@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const Build = std.Build;
+const Target = std.Target;
+const OptimizeMode = std.builtin.OptimizeMode;
 
 pub fn build(b: *Build) void {
     const optimize = b.standardOptimizeOption(.{});
@@ -13,7 +15,7 @@ pub fn build(b: *Build) void {
 
     // Same app, two CPUs: Neoverse V2 (the SVE2 family) and baseline.
     const app_v2 = app(b, optimize, .{
-        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.neoverse_v2 },
+        .cpu_model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 },
     });
     const app_baseline = app(b, optimize, .{});
 
@@ -28,7 +30,7 @@ pub fn build(b: *Build) void {
     });
 }
 
-fn app(b: *Build, optimize: std.builtin.OptimizeMode, query: std.Target.Query) *Build.Step.Compile {
+fn app(b: *Build, optimize: OptimizeMode, query: Target.Query) *Build.Step.Compile {
     return b.addExecutable(.{
         .name = "app",
         .root_module = b.createModule(.{
