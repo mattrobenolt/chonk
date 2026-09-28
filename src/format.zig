@@ -24,8 +24,12 @@ pub const page_size = 4096;
 ///    auxv word.
 ///  - `cpuid` (x86_64): `mask` transports `(leaf << 32) | subleaf`,
 ///    `expected` transports `(register << 5) | bit`; the bit must be set.
-///  - `midr`: reserved — the packer rejects it until the stub learns to
-///    read it (direction.md step 7).
+///  - `midr` (aarch64): `(value & mask) == expected`, value from
+///    `MIDR_EL1`. The stub reads it via `mrs`, gated on HWCAP_CPUID —
+///    without that bit the kernel does not emulate the read and the
+///    condition fails (the dispatch falls to the next tier, the safe
+///    direction). Use `pack.midrPart(implementer, part)` for the common
+///    part-number match.
 pub const Source = enum(u8) {
     /// `AT_HWCAP` (auxv type 16).
     hwcap = 0,

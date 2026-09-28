@@ -62,6 +62,15 @@ export fn _start() callconv(.naked) noreturn {
 /// Read CPUID — x86_64 only. One instruction, no privileges needed; the
 /// kernel is not involved, which is the whole difference from aarch64's
 /// auxv-mediated detection.
+/// Read MIDR_EL1 — aarch64 only. The kernel traps and emulates this read
+/// at EL0, but only when HWCAP_CPUID (AT_HWCAP bit 11) is advertised;
+/// callers must gate on it or the read faults.
+fn readMidr() u64 {
+    return asm volatile ("mrs x0, midr_el1"
+        : [out] "={x0}" (-> u64),
+    );
+}
+
 fn readCpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
@@ -220,7 +229,19 @@ fn matches(
                 }
                 fatal("cpuid condition on a non-x86_64 stub");
             },
-            .midr => fatal("this stub does not read MIDR_EL1 yet"),
+            .midr => blk: {
+                // Comptime-gated: the aarch64 asm is never analyzed on
+                // x86_64 (same pattern as the cpuid prong).
+                if (builtin.cpu.arch == .aarch64) {
+                    // The kernel emulates the read only when HWCAP_CPUID
+                    // is advertised. Without it the read would fault, so
+                    // fail the condition instead — the dispatch falls to
+                    // the next tier, which is the safe direction.
+                    if (hwcap & (1 << 11) == 0) return false;
+                    break :blk (readMidr() & condition.mask) == condition.expected;
+                }
+                fatal("midr condition on a non-aarch64 stub");
+            },
         };
         if (!ok) return false;
     }

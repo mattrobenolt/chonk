@@ -16,6 +16,7 @@ const stdio = @import("src/stdio.zig");
 /// The vocabulary shared with the ZON config — pack.zig is the one
 /// definition; re-exported for consumer ergonomics.
 pub const Match = pack.Match;
+pub const midrPart = pack.midrPart;
 pub const Bit = pack.Bit;
 
 const aarch64 = std.Target.aarch64;
@@ -229,7 +230,15 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         // An explicit match overrides inference (#2): it covers silicon
         // chonk has not heard of, and the unmappable bits (pmull, sha1,
         // ...) that inference can never express.
-        const match = if (spec.match.len > 0) spec.match else inferMatches(b, resolved.result);
+        // Dupe the caller's match slice into the graph arena: a runtime
+        // call like midrPart(...) inside `&.{ ... }` creates a stack
+        // temporary whose slice dangles by make() time — the bit-literal
+        // case only worked because comptime-known literals land in rodata.
+        // Inference output is already arena-owned.
+        const match = if (spec.match.len > 0)
+            b.allocator.dupe(pack.Match, spec.match) catch @panic("OOM")
+        else
+            inferMatches(b, resolved.result);
         const fallback = isBaseline(resolved.result);
         if (fallback) {
             fallback_count += 1;

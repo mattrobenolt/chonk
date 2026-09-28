@@ -47,11 +47,20 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
         .install = false, // wired into the chonk step below, not the default
         .targets = &.{
+            // The full cloud ARM ladder, strongest first (first match wins):
+            // V3 = AWS Graviton5; V2 = Graviton4 / GCP Axion;
+            // V1 = Graviton3; N1 = Graviton2 / Azure Cobalt 100 / Ampere
+            // Altra. V3 and V2 advertise the SAME hwcap words on many
+            // hosts, so V3 is separated by its MIDR part number — the
+            // tiebreak. No fallback listed — the arch baseline
+            // (Graviton1 / Cortex-A72) is appended automatically.
+            .{
+                .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v3 },
+                .match = &.{chonk.midrPart(0x41, 0xd84)},
+            },
             .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
+            .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v1 } },
             .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_n1 } },
-            // no fallback listed — the arch baseline is appended
-            // automatically as the last entry. n1 exercises the base-word
-            // inference (aes/sha2/crc32/atomics/dotprod — no SVE at all).
         },
     });
     const install_arm = b.addInstallFileWithDir(fat_arm, .bin, "app");

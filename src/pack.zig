@@ -245,6 +245,21 @@ pub fn spec(bit: Bit) struct { source: format.Source, mask: u64 } {
     return .{ .source = e.source, .mask = e.mask };
 }
 
+/// An MIDR_EL1 part-number match — the tiebreak for same-hwcap silicon
+/// (Neoverse V3 advertises the same HWCAP/HWCAP2 as V2 on many hosts, but
+/// the part number is exact: V1 0xd40, N1 0xd0c, V2 0xd4f, V3 0xd84,
+/// Cortex-A72 0xd08). Matches implementer (bits 31-24) and part number
+/// (bits 15-4); variant/revision are masked out, the architecture field
+/// (always 0xf on aarch64) is included. Verify part numbers from the
+/// silicon's TRM or a live `mrs` dump before adding a tier.
+pub fn midrPart(implementer: u8, part: u12) Match {
+    return .{
+        .source = .midr,
+        .mask = 0xFF0F_FFF0,
+        .expected = (@as(u64, implementer) << 24) | (0xF << 16) | (@as(u64, part) << 4),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
 // ---------------------------------------------------------------------------
@@ -430,14 +445,6 @@ fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
             const source = m.source orelse {
                 return configFail("variant '{s}': raw match needs a source", .{v.name});
             };
-            // The stub cannot read MIDR_EL1 yet (step 7) — refuse at pack
-            // time rather than shipping a fat binary that dies at dispatch.
-            if (source == .midr) {
-                return configFail(
-                    "variant '{s}': midr source lands with MIDR_EL1 support (step 7)",
-                    .{v.name},
-                );
-            }
             if (mask == 0) {
                 return configFail("variant '{s}': mask 0 checks nothing", .{v.name});
             }
@@ -787,12 +794,15 @@ test "compileMatches: rejects mixed and incomplete forms" {
         .binary = "b",
         .match = &.{.{}},
     }));
-    // MIDR source is gated until the stub can read it (step 7).
-    try testing.expectError(error.Config, compileMatches(arena, .{
+    // MIDR compiles now (step 7): the part-number tiebreak.
+    const midr_conditions = try compileMatches(arena, .{
         .name = "v",
         .binary = "b",
-        .match = &.{.{ .source = .midr, .mask = 1, .expected = 1 }},
-    }));
+        .match = &.{midrPart(0x41, 0xd84)},
+    });
+    try testing.expectEqual(@as(u64, 0xFF0F_FFF0), midr_conditions[0].mask);
+    try testing.expectEqual(@as(u64, 0x410F_D840), midr_conditions[0].expected);
+    try testing.expectEqual(format.Source.midr, midr_conditions[0].source);
 }
 
 test "elfCheck: machine + program-ness" {
