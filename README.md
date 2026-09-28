@@ -1,4 +1,4 @@
-# chonk
+<p align="center"><img src="chonk.svg" alt="chonk" width="620"></p>
 
 A fat binary dispatcher for Linux. A fat binary is one executable file that
 contains several builds of the same program. The running CPU picks the
