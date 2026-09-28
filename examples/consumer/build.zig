@@ -10,7 +10,8 @@
 const std = @import("std");
 const Build = std.Build;
 const Target = std.Target;
-const OptimizeMode = std.builtin.OptimizeMode;
+
+const chonk = @import("chonk");
 
 pub fn build(b: *Build) void {
     const optimize = b.standardOptimizeOption(.{});
@@ -35,7 +36,6 @@ pub fn build(b: *Build) void {
     // `zig build chonk`: the release fleet. One fat binary per species —
     // one chonk.addExecutable call per arch — each dispatching by CPU
     // features at exec time.
-    const chonk = b.lazyImport(@This(), "chonk") orelse return;
     const chonk_step = b.step("chonk", "Build the fat binaries");
 
     // aarch64: the Neoverse tiers + baseline fallback. The skeleton carries

@@ -215,7 +215,7 @@ its build.zig — the near-drop-in replacement for `b.addExecutable`, with a
 list of compilation targets instead of one:
 
 ```zig
-const chonk = b.lazyImport(@This(), "chonk") orelse return;
+const chonk = @import("chonk");
 _ = chonk.addExecutable(b, .{
     .name = "app",
     .root_source_file = b.path("src/main.zig"),
@@ -238,7 +238,8 @@ _ = chonk.addExecutable(b, .{
   (the ZON config's raw form).
 - Intermediates auto-name from their CPU models ("neoverse_v2",
   "generic"), cache-only, never installed; display names likewise.
-- `b.lazyImport` hands the consumer this repo's build.zig struct, which
+- A plain `@import("chonk")` hands the consumer this repo's build.zig
+  struct (`b.lazyImport` is only for lazy dependencies), which
   re-exports `pack.zig` (the same module the CLI uses). The custom
   `PackStep`'s make() calls `pack.packAll` with `b.graph.io` — in-process,
   no subprocess, no argv. The freestanding stub compiles into the

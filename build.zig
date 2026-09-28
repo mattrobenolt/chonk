@@ -182,7 +182,7 @@ pub const ExecutableOptions = struct {
 /// near-drop-in replacement, from another project's build.zig with this
 /// repo as a `chonk` dependency:
 ///
-///     const chonk = b.lazyImport(@This(), "chonk") orelse return;
+///     const chonk = @import("chonk");
 ///     _ = chonk.addExecutable(b, .{
 ///         .name = "app",
 ///         .root_source_file = b.path("src/main.zig"),
