@@ -1,0 +1,21 @@
+name: 'Setup Nix devshell'
+description: 'Installs Nix and enables magic-nix-cache'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Nix
+      uses: DeterminateSystems/determinate-nix-action@58b42ef6cd91478a14253e00805ec7c79eb1566a # v3.22.4
+      with:
+        summarize: false
+
+    - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+      with:
+        # We only use the GitHub Actions cache backend (which authenticates via
+        # the auto-injected ACTIONS_RUNTIME_TOKEN, no id-token: write needed).
+        # Disable FlakeHub Cache so the action doesn't try OIDC auth against a
+        # service we don't use.
+        use-flakehub: false
+
+    # The devshell has no fetched flake inputs (build.zig.zon has zero
+    # deps) — nothing else to cache; nix store paths ride the nix cache.

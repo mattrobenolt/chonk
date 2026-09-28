@@ -1,0 +1,68 @@
+name: chonk
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build, unit tests, lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+
+      # just build = zig build + zig build test + ziglint. Arch-blind:
+      # the CLI, both cross-compiled freestanding stubs, the unit suite,
+      # and lint all pass on any host arch.
+      - name: Build + unit tests + lint
+        run: nix develop --command just build
+
+  test-arm:
+    name: e2e aarch64 (native + qemu tier matrix)
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+
+      # The full aarch64 battery. NOTE: GitHub arm runners are Ampere
+      # Altra (Neoverse N1) — NO SVE — so the native dispatch legs select
+      # lower tiers than an sve-capable host; the tolerant assertions
+      # accept the known tier set. The qemu legs carry the deterministic
+      # matrix; the factory's implicit baseline covers the no-sve case.
+      - name: Full aarch64 e2e battery
+        run: nix develop --command just e2e-arm
+
+  test-x86:
+    name: e2e x86_64 (native dispatch — the wall's other side)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+
+      # The x86_64 battery: the full native dispatch path that the
+      # aarch64 dev box cannot run (qemu hands foreign-arch execveat to
+      # the host kernel — the errno 8 wall). This runner runs it for
+      # real: the CPUID conditions select a tier on real x86 hardware.
+      - name: Full x86_64 e2e battery
+        run: nix develop --command just e2e-x86

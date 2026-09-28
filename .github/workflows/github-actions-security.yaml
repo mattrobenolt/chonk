@@ -1,0 +1,36 @@
+name: GitHub Actions Security
+
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'justfile'
+      - 'flake.nix'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/**'
+      - 'justfile'
+      - 'flake.nix'
+
+permissions: {}
+
+jobs:
+  zizmor-and-pins:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+
+      # Both tools are devshell-native (flake): no external action, default
+      # token only — no private actions or inputs to audit.
+      - name: zizmor + pinact
+        run: nix develop --command just lint-actions pinact-check

@@ -40,6 +40,8 @@
               zigdoc
               qemu-user
               just
+              pinact
+              zizmor
             ];
           };
         };

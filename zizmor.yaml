@@ -1,0 +1,10 @@
+# zizmor 1.30.1's self-repository audit recommends GitHub's `uses: $/...`
+# syntax (github.blog 2026-07-30), but 1.30.1's own parser cannot LOAD that
+# syntax — parser support is on zizmor main, unreleased. Ignore our two
+# workflow files until the bump; then flip every `./.github/actions/...` to
+# `$.github/actions/...` and delete this block.
+rules:
+  self-repository:
+    ignore:
+      - chonk.yaml
+      - github-actions-security.yaml
