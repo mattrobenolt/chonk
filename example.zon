@@ -3,18 +3,18 @@
 //   ./zig-out/bin/chonk pack zig-out/bin/stub example.zon fat && ./fat
 //
 // Variant order IS priority: the first variant whose conditions all pass
-// wins, else the default. Condition evaluation lands with §7 step 6 — until
+// wins, else the fallback. Condition evaluation lands with §7 step 6 — until
 // then the stub answers "this stub dispatches exactly one variant".
 .{
     .variants = .{
-        // Neoverse V2 and friends — the SVE2 extension family.
-        // Bit names imply their source (SVE2 is an AT_HWCAP2 bit); the
-        // packer's table knows, so the config never says "hwcap2".
+        // Neoverse V2 and friends — the SVE2 extension family. A bit name
+        // implies its source (sve2 is an AT_HWCAP2 bit); the enum is checked
+        // at parse time, so a typo is a line:column parse error.
         .{
             .name = "neoverse-v2",
             .binary = "zig-out/bin/chonk", // swap for your -march build
             .match = .{
-                .{ .bit = "SVE2" },
+                .{ .bit = .sve2 },
             },
         },
 
@@ -24,15 +24,14 @@
             .name = "neoverse-v1",
             .binary = "/run/current-system/sw/bin/true",
             .match = .{
-                .{ .bit = "SVE" },
+                .{ .bit = .sve },
             },
         },
 
-        // Fallback when nothing above matched. Exactly one per config.
+        // The fallback: the one variant with no match.
         .{
             .name = "generic",
             .binary = "/run/current-system/sw/bin/true",
-            .default = true,
         },
     },
 }

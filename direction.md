@@ -149,36 +149,38 @@ Ordinary hosted tool — no freestanding constraints, write it in whatever's
 comfortable (Zig, Rust, even Python for a first draft since it's pure
 "read binaries + concatenate + emit struct bytes").
 
-Input: a config file. **Decided (2026-09-27): ZON** — Zig-native, `std.zon.parse`
-exists in 0.16, no hand-rolled YAML subset parser to maintain. **Refined
-(step 5): a named bit implies its source** — the table knows SVE2 is hwcap2,
-so the config never says `source = "hwcap2"` and the mismatch-error class
-cannot exist. Binary paths are relative to the config file's own directory.
+Input: a config file. **Decided (2026-09-27): ZON** — Zig-native,
+`std.zon.parse` exists in 0.16, no hand-rolled YAML subset parser to
+maintain. **Refined (post step 6): bits are a Zig enum** — `bit = .sve2`
+type-checks at parse time (a typo is a line:column parse error with a note
+listing the vocabulary), and a bit implies its source, so the config never
+says "hwcap2". **The variant with no match is the fallback** — `default =
+true` was always redundant with zero conditions. Binary paths are relative
+to the config file's own directory.
 
 ```zig
 .{
     .variants = .{
         .{ .name = "neoverse-v2", .binary = "build/app-v2", .match = .{
-            .{ .bit = "SVE2" },
+            .{ .bit = .sve2 },
         } },
         .{ .name = "neoverse-v1", .binary = "build/app-v1", .match = .{
-            .{ .bit = "SVE" },
+            .{ .bit = .sve },
         } },
-        // Raw form for anything the table doesn't name:
-        //   .{ .source = "hwcap", .mask = 0x400000, .expected = 0x400000 }
-        .{ .name = "generic", .binary = "build/app-generic", .default = true },
+        // Raw form for anything the enum doesn't name:
+        //   .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 }
+        .{ .name = "generic", .binary = "build/app-generic" }, // the fallback
     },
 }
 ```
 
 Packer responsibilities (shipped as `chonk pack <stub> <config.zon> <output>`):
 
-1. Parse ZON, resolve named bit constants (`SVE`, `SVE2`, ...) via the
-   packer's bit table (pinned from the kernel UAPI header) so the config
-   stays human-readable instead of raw hex masks. A name implies its source.
-2. Validate: at least one variant, exactly one `default = true`, no duplicate
-   names, every match is well-formed (bit XOR raw, nonzero mask, known
-   source).
+1. Parse ZON, resolve bit enum values (`.sve2`, ...) via `Bit.spec()`
+   (pinned from the kernel UAPI header) so the config stays human-readable
+   instead of raw hex masks. A bit implies its source.
+2. Validate: at least one variant, exactly one fallback (no match), no
+   duplicate names, every match is well-formed (bit XOR raw, nonzero mask).
 3. Read `stub` + payload bytes; validate every ELF: magic, `e_machine` must
    agree across stub + all payloads (stamped into the footer), and each
    payload must be a program — `e_type ∈ {EXEC, DYN}` with a nonzero entry
@@ -216,21 +218,27 @@ const chonk = b.lazyImport(@This(), "chonk") orelse return;
 _ = chonk.addFatBinary(b, .{
     .name = "app",
     .variants = &.{
-        .{ .name = "neoverse-v2", .exe = app_v2, .bit = "SVE2" },
-        .{ .name = "baseline", .exe = app_baseline, .default = true },
+        .{ .exe = app_v2, .name = "neoverse-v2", .bit = .sve2 },
+        .{ .exe = app_baseline, .name = "baseline" }, // the fallback
     },
 });
 ```
 
-- `b.lazyImport` hands the consumer this repo's build.zig struct —
-  `addFatBinary` runs in-process and wires: the dep's `chonk` CLI as a Run
-  step, the dep's freestanding `stub`, and the consumer's variant
-  executables, then installs `zig-out/bin/<name>` (disable with
-  `install = false`; the fat file's LazyPath is returned either way).
-- Variants travel as CLI flags — `chonk pack --stub F --out F --variant NAME
-  (--bit NAME | --default) FILE` — because build-graph artifact paths resolve
-  only at make time; a ZON config on disk cannot name them. Humans keep the
-  ZON form.
+- `b.lazyImport` hands the consumer this repo's build.zig struct, which
+  re-exports `pack.zig` (the same module the CLI uses). `addFatBinary` runs
+  IN-PROCESS: a custom `PackStep` whose make() calls `pack.packAll` with
+  `b.graph.io` — no subprocess, no argv marshalling. The freestanding stub
+  is compiled into the CONSUMER's graph from source (ReleaseSmall, always)
+  via `dep.path("src/stub.zig")`.
+- The step is content-addressed like any build step (manifest over stub +
+  payload files + conditions); installs `zig-out/bin/<name>` unless
+  `install = false` — the fat file's LazyPath is returned either way.
+- The API and the ZON config share one vocabulary: `Match`/`Bit` are
+  defined once in pack.zig; a config typo and a build.zig typo fail the
+  same way. Only the payload reference differs (path string vs `exe`).
+- Inference (planned): when `bit` is omitted on a non-fallback variant,
+  derive conditions from the exe's target — the feature delta over
+  baseline, mapped through the same enum.
 - One fat binary per architecture: the trailer's machine field is a species
   check. Cross-arch universal binaries are not possible on Linux — the
   kernel loads the front ELF as the stub's arch and has no Mach-O-style

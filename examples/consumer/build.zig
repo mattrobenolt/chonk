@@ -12,8 +12,6 @@ pub fn build(b: *Build) void {
     const chonk = b.lazyImport(@This(), "chonk") orelse return;
 
     // Same app, two CPUs: Neoverse V2 (the SVE2 family) and baseline.
-    // Build these exactly like any other executable — the packer checks
-    // every variant agrees on machine.
     const app_v2 = app(b, optimize, .{
         .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.neoverse_v2 },
     });
@@ -24,8 +22,8 @@ pub fn build(b: *Build) void {
     _ = chonk.addFatBinary(b, .{
         .name = "app",
         .variants = &.{
-            .{ .name = "neoverse-v2", .exe = app_v2, .bit = "SVE2" },
-            .{ .name = "baseline", .exe = app_baseline, .default = true },
+            .{ .exe = app_v2, .name = "neoverse-v2", .bit = .sve2 },
+            .{ .exe = app_baseline, .name = "baseline" }, // the fallback
         },
     });
 }

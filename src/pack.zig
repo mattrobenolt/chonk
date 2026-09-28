@@ -43,71 +43,72 @@ pub const Variant = struct {
     /// Payload binary path, relative to the config file's directory.
     binary: []const u8,
     /// Conditions ANDed together. First variant in file order whose
-    /// conditions all pass wins.
+    /// conditions all pass wins. THE VARIANT WITH NO MATCH IS THE
+    /// FALLBACK — exactly one such variant per config.
     match: []const Match = &.{},
-    /// The fallback when nothing matches. Exactly one variant must set it.
-    default: bool = false,
 };
 
 pub const Match = struct {
-    /// Bit name from the kernel hwcap vocabulary (`bit_table`) — the bit
-    /// must be set. Implies its source; excludes the raw fields below.
-    bit: ?[]const u8 = null,
+    /// Kernel hwcap bit that must be set. Implies its source; excludes
+    /// the raw fields below.
+    bit: ?Bit = null,
     /// Raw form: `(source & mask) == expected`. All three fields required;
     /// excludes `bit`.
-    source: ?[]const u8 = null,
+    source: ?format.Source = null,
     mask: ?u64 = null,
     expected: ?u64 = null,
 };
 
 // ---------------------------------------------------------------------------
-// Bit vocabulary — the only place chonk knows what "SVE2" means.
+// Bit vocabulary — the only place chonk knows what "sve2" means.
 // ---------------------------------------------------------------------------
 
-const Bit = struct {
-    source: format.Source,
-    mask: u64,
-};
-
-/// Kernel hwcap bit names the config accepts, pinned from
+/// Kernel hwcap bits the config accepts, pinned from
 /// arch/arm64/include/uapi/asm/hwcap.h (torvalds master, 2026-09-27). A
 /// name implies its source — that is the whole reason named bits exist:
-/// the config never says "hwcap2", the table does.
-const bit_table = std.StaticStringMap(Bit).initComptime(.{
-    .{ "SVE", Bit{ .source = .hwcap, .mask = 1 << 22 } },
-    .{ "SVE2", Bit{ .source = .hwcap2, .mask = 1 << 1 } },
-    .{ "SVEAES", Bit{ .source = .hwcap2, .mask = 1 << 2 } },
-    .{ "SVEPMULL", Bit{ .source = .hwcap2, .mask = 1 << 3 } },
-    .{ "SVEBITPERM", Bit{ .source = .hwcap2, .mask = 1 << 4 } },
-    .{ "SVESHA3", Bit{ .source = .hwcap2, .mask = 1 << 5 } },
-    .{ "SVESM4", Bit{ .source = .hwcap2, .mask = 1 << 6 } },
-    .{ "SVEI8MM", Bit{ .source = .hwcap2, .mask = 1 << 9 } },
-    .{ "SVEBF16", Bit{ .source = .hwcap2, .mask = 1 << 12 } },
-    .{ "I8MM", Bit{ .source = .hwcap2, .mask = 1 << 13 } },
-    .{ "BF16", Bit{ .source = .hwcap2, .mask = 1 << 14 } },
-    .{ "SME", Bit{ .source = .hwcap2, .mask = 1 << 23 } },
-});
+/// the config never says "hwcap2", the enum does.
+pub const Bit = enum {
+    sve,
+    sve2,
+    sveaes,
+    svepmull,
+    svebitperm,
+    svesha3,
+    svesm4,
+    svei8mm,
+    svebf16,
+    i8mm,
+    bf16,
+    sme,
+
+    /// The wire form: which source word, which bit.
+    pub fn spec(bit: Bit) struct { source: format.Source, mask: u64 } {
+        return switch (bit) {
+            .sve => .{ .source = .hwcap, .mask = 1 << 22 },
+            .sve2 => .{ .source = .hwcap2, .mask = 1 << 1 },
+            .sveaes => .{ .source = .hwcap2, .mask = 1 << 2 },
+            .svepmull => .{ .source = .hwcap2, .mask = 1 << 3 },
+            .svebitperm => .{ .source = .hwcap2, .mask = 1 << 4 },
+            .svesha3 => .{ .source = .hwcap2, .mask = 1 << 5 },
+            .svesm4 => .{ .source = .hwcap2, .mask = 1 << 6 },
+            .svei8mm => .{ .source = .hwcap2, .mask = 1 << 9 },
+            .svebf16 => .{ .source = .hwcap2, .mask = 1 << 12 },
+            .i8mm => .{ .source = .hwcap2, .mask = 1 << 13 },
+            .bf16 => .{ .source = .hwcap2, .mask = 1 << 14 },
+            .sme => .{ .source = .hwcap2, .mask = 1 << 23 },
+        };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
 // ---------------------------------------------------------------------------
 
-/// `chonk pack <stub> <config.zon> <output>` for humans, or the flag form
-/// the build system drives:
-///
-///   chonk pack --stub FILE --out FILE
-///              --variant NAME (--bit NAME | --default) FILE ...
-///
-/// The flag form exists because build-graph artifact paths resolve only
-/// at make time — a ZON config on disk cannot name them. args = everything
+/// `chonk pack <stub> <config.zon> <output>` — the human door. The build
+/// system calls `packAll` in-process as a module instead. args = everything
 /// after the subcommand word; stdio is initialized by the front door.
 pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     const cwd = Io.Dir.cwd();
-
-    if (args.len > 0 and mem.eql(u8, args[0], "--stub")) {
-        const spec = try parseFlagArgs(arena, args);
-        return packAll(io, arena, cwd, cwd, spec.out, spec.stub, spec.config);
-    }
 
     if (args.len != 3) {
         stdio.writeAll(.err, "usage: chonk pack <stub> <config.zon> <output>");
@@ -139,7 +140,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
 
 /// The shared tail of both pack forms: read + check the stub, validate the
 /// config, load + compile variants, write the fat binary, report.
-fn packAll(
+pub fn packAll(
     io: Io,
     arena: Allocator,
     cwd: Io.Dir,
@@ -158,7 +159,7 @@ fn packAll(
 
     stdio.print(.out, "packed: {d} variants, total {d}", .{ loaded.len, lay.size });
     for (loaded, lay.payload_offsets) |v, offset| {
-        const suffix: []const u8 = if (v.cfg.default) ", default" else "";
+        const suffix: []const u8 = if (v.cfg.match.len == 0) ", fallback" else "";
         stdio.print(
             .out,
             "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s})",
@@ -168,104 +169,18 @@ fn packAll(
     return 0;
 }
 
-/// The flag form's parse result: same shape the ZON path produces.
-const FlagSpec = struct {
-    stub: []const u8,
-    out: []const u8,
-    config: Config,
-};
-
-fn parseFlagArgs(arena: Allocator, args: []const [:0]const u8) !FlagSpec {
-    var stub: ?[]const u8 = null;
-    var out: ?[]const u8 = null;
-    var variants: std.ArrayList(Variant) = .empty;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (mem.eql(u8, arg, "--stub")) {
-            stub = try nextArg("--stub", args, &i);
-        } else if (mem.eql(u8, arg, "--out")) {
-            out = try nextArg("--out", args, &i);
-        } else if (mem.eql(u8, arg, "--variant")) {
-            const name = try nextArg("--variant", args, &i);
-            var bit: ?[]const u8 = null;
-            var is_default = false;
-            while (i + 1 < args.len and isFlag(args[i + 1])) {
-                i += 1;
-                if (mem.eql(u8, args[i], "--bit")) {
-                    bit = try nextArg("--bit", args, &i);
-                } else if (mem.eql(u8, args[i], "--default")) {
-                    is_default = true;
-                } else {
-                    return usageFail("unknown variant flag '{s}'", .{args[i]});
-                }
-            }
-            if (bit != null and is_default) {
-                return usageFail("variant '{s}' is both --bit and --default", .{name});
-            }
-            if (bit == null and !is_default) {
-                return usageFail("variant '{s}' needs --bit NAME or --default", .{name});
-            }
-            if (i + 1 >= args.len) {
-                return usageFail("variant '{s}' needs its payload path last", .{name});
-            }
-            i += 1;
-            const match: []const Match = if (bit) |bit_name| blk: {
-                const m = try arena.create(Match);
-                m.* = .{ .bit = bit_name };
-                break :blk m[0..1];
-            } else &.{};
-            try variants.append(arena, .{
-                .name = name,
-                .binary = args[i],
-                .match = match,
-                .default = is_default,
-            });
-        } else {
-            return usageFail("unknown argument '{s}'", .{arg});
-        }
-    }
-
-    if (stub == null) return usageFail("--stub is required", .{});
-    if (out == null) return usageFail("--out is required", .{});
-    if (variants.items.len == 0) return usageFail("at least one --variant is required", .{});
-
-    return .{
-        .stub = stub.?,
-        .out = out.?,
-        .config = .{ .variants = try variants.toOwnedSlice(arena) },
-    };
-}
-
-fn isFlag(arg: []const u8) bool {
-    return arg.len >= 3 and mem.startsWith(u8, arg, "--");
-}
-
-fn nextArg(comptime flag: []const u8, args: []const [:0]const u8, i: *usize) ![]const u8 {
-    if (i.* + 1 >= args.len) return usageFail("{s} needs a value", .{flag});
-    i.* += 1;
-    return args[i.*];
-}
-
-/// Report a flag-form usage problem — mapped to exit 2 by the front door.
-fn usageFail(comptime fmt: []const u8, args: anytype) error{Usage} {
-    stdio.print(.err, "chonk: " ++ fmt, args);
-    return error.Usage;
-}
-
 /// Config-level checks that need no filesystem: variant count, exactly one
 /// default, unique names.
 fn validateConfig(config: Config) !void {
     if (config.variants.len == 0) return configFail("config has no variants", .{});
-    var default_count: usize = 0;
+    var fallback_count: usize = 0;
     for (config.variants) |v| {
-        if (v.default) default_count += 1;
+        if (v.match.len == 0) fallback_count += 1;
     }
-    if (default_count != 1) {
+    if (fallback_count != 1) {
         return configFail(
-            "exactly one variant must set default = true (found {d})",
-            .{default_count},
+            "exactly one variant must have no match (the fallback) — found {d}",
+            .{fallback_count},
         );
     }
     for (config.variants, 0..) |a, i| {
@@ -315,41 +230,33 @@ fn loadVariants(
 fn compileMatches(arena: Allocator, v: Variant) ![]const format.Condition {
     const out = try arena.alloc(format.Condition, v.match.len);
     for (v.match, 0..) |m, i| {
-        if (m.bit) |bit_name| {
+        if (m.bit) |bit| {
             if (m.source != null or m.mask != null or m.expected != null) {
                 return configFail(
                     "variant '{s}': bit form excludes source/mask/expected",
                     .{v.name},
                 );
             }
-            const bit = bit_table.get(bit_name) orelse {
-                return configFail("variant '{s}': unknown bit name '{s}'", .{ v.name, bit_name });
-            };
-            out[i] = .{ .mask = bit.mask, .expected = bit.mask, .source = bit.source };
+            const s = bit.spec();
+            out[i] = .{ .mask = s.mask, .expected = s.mask, .source = s.source };
         } else {
-            const source_str = m.source orelse {
-                return configFail(
-                    "variant '{s}': match needs bit = \"...\" or source+mask+expected",
-                    .{v.name},
-                );
-            };
             const mask = m.mask orelse {
                 return configFail("variant '{s}': raw match needs a mask", .{v.name});
             };
             const expected = m.expected orelse {
                 return configFail("variant '{s}': raw match needs an expected", .{v.name});
             };
+            const source = m.source orelse {
+                return configFail("variant '{s}': raw match needs a source", .{v.name});
+            };
             // The stub cannot read MIDR_EL1 yet (step 7) — refuse at pack
             // time rather than shipping a fat binary that dies at dispatch.
-            if (mem.eql(u8, source_str, "midr")) {
+            if (source == .midr) {
                 return configFail(
                     "variant '{s}': midr source lands with MIDR_EL1 support (step 7)",
                     .{v.name},
                 );
             }
-            const source = parseSource(source_str) orelse {
-                return configFail("variant '{s}': unknown source '{s}'", .{ v.name, source_str });
-            };
             if (mask == 0) {
                 return configFail("variant '{s}': mask 0 checks nothing", .{v.name});
             }
@@ -357,12 +264,6 @@ fn compileMatches(arena: Allocator, v: Variant) ![]const format.Condition {
         }
     }
     return out;
-}
-
-fn parseSource(s: []const u8) ?format.Source {
-    if (mem.eql(u8, s, "hwcap")) return .hwcap;
-    if (mem.eql(u8, s, "hwcap2")) return .hwcap2;
-    return null;
 }
 
 /// Report a config problem and hand back the config error — mapped to
@@ -503,7 +404,7 @@ fn writeFat(
             .payload_size = v.payload.len,
             .condition_offset = lay.condition_offsets[i],
             .condition_count = @intCast(v.conditions.len),
-            .is_default = if (v.cfg.default) 1 else 0,
+            .is_default = if (v.cfg.match.len == 0) 1 else 0,
         };
     }
     const footer: format.Footer = .{
@@ -599,27 +500,34 @@ test "config parses from ZON" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    stdio.init(testing.io);
 
     const source =
         \\.{ .variants = .{
         \\    .{ .name = "neoverse-v2", .binary = "bin/app-v2", .match = .{
-        \\        .{ .bit = "SVE2" },
-        \\        .{ .source = "hwcap", .mask = 0x400000, .expected = 0x400000 },
+        \\        .{ .bit = .sve2 },
+        \\        .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 },
         \\    } },
-        \\    .{ .name = "generic", .binary = "bin/app-generic", .default = true },
+        \\    // The fallback: no match at all.
+        \\    .{ .name = "generic", .binary = "bin/app-generic" },
         \\} }
     ;
     const buf = try arena.allocSentinel(u8, source.len, 0);
     @memcpy(buf, source);
-    const config = try zon.parse.fromSliceAlloc(Config, arena, buf, null, .{
+    var diag: zon.parse.Diagnostics = .{};
+    const config = zon.parse.fromSliceAlloc(Config, arena, buf, &diag, .{
         .free_on_error = false,
-    });
+    }) catch |err| {
+        stdio.print(.err, "parse failed: {f}", .{&diag});
+        return err;
+    };
 
     try testing.expectEqual(@as(usize, 2), config.variants.len);
     try testing.expectEqualStrings("neoverse-v2", config.variants[0].name);
     try testing.expectEqual(@as(usize, 2), config.variants[0].match.len);
-    try testing.expectEqualStrings("SVE2", config.variants[0].match[0].bit.?);
-    try testing.expect(config.variants[1].default);
+    try testing.expectEqual(Bit.sve2, config.variants[0].match[0].bit.?);
+    try testing.expectEqual(format.Source.hwcap, config.variants[0].match[1].source.?);
+    // No match = the fallback.
     try testing.expectEqual(@as(usize, 0), config.variants[1].match.len);
 }
 
@@ -632,7 +540,7 @@ test "compileMatches: bit name implies source and expected" {
     const v: Variant = .{
         .name = "v2",
         .binary = "bin/app-v2",
-        .match = &.{.{ .bit = "SVE2" }},
+        .match = &.{.{ .bit = .sve2 }},
     };
     const conditions = try compileMatches(arena, v);
     try testing.expectEqual(@as(usize, 1), conditions.len);
@@ -641,88 +549,47 @@ test "compileMatches: bit name implies source and expected" {
     try testing.expectEqual(format.Source.hwcap2, conditions[0].source);
 }
 
-test "flag args parse to a valid config" {
+test "ZON rejects unknown bits at parse time" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     stdio.init(testing.io);
 
-    const argv = [_][:0]const u8{
-        "--stub",      "stub-path",
-        "--out",       "out-path",
-        "--variant",   "neoverse-v2",
-        "--bit",       "SVE2",
-        "bin/app-v2",
-        "--variant",   "generic",
-        "--default",
-        "bin/app-generic",
-    };
-    const spec = try parseFlagArgs(arena, &argv);
-    try testing.expectEqualStrings("stub-path", spec.stub);
-    try testing.expectEqualStrings("out-path", spec.out);
-    try testing.expectEqual(@as(usize, 2), spec.config.variants.len);
-    try testing.expectEqualStrings("neoverse-v2", spec.config.variants[0].name);
-    try testing.expectEqualStrings("SVE2", spec.config.variants[0].match[0].bit.?);
-    try testing.expect(spec.config.variants[1].default);
-
-    // The synthesized config flows through the normal pipeline.
-    try validateConfig(spec.config);
-    const conditions = try compileMatches(arena, spec.config.variants[0]);
-    try testing.expectEqual(@as(u64, 1 << 1), conditions[0].mask);
-    try testing.expectEqual(format.Source.hwcap2, conditions[0].source);
+    // A bad bit name is a type error now — line:column from the parser,
+    // not a runtime configFail.
+    const source =
+        \\.{ .variants = .{
+        \\    .{ .name = "x", .binary = "b", .match = .{ .{ .bit = .totally_real } } },
+        \\    .{ .name = "generic", .binary = "g" },
+        \\} }
+    ;
+    const buf = try arena.allocSentinel(u8, source.len, 0);
+    @memcpy(buf, source);
+    var diag: zon.parse.Diagnostics = .{};
+    try testing.expectError(error.ParseZon, zon.parse.fromSliceAlloc(
+        Config,
+        arena,
+        buf,
+        &diag,
+        .{ .free_on_error = false },
+    ));
 }
 
-test "flag args reject malformed forms" {
+test "compileMatches: rejects mixed and incomplete forms" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     stdio.init(testing.io);
 
-    // Missing --stub.
-    try testing.expectError(
-        error.Usage,
-        parseFlagArgs(arena, &[_][:0]const u8{ "--out", "o" }),
-    );
-    // Variant with no matcher.
-    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
-        "--stub",    "s",
-        "--out",     "o",
-        "--variant", "v",
-        "bin/x",
-    }));
-    // Variant missing its payload path.
-    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
-        "--stub",    "s",
-        "--out",     "o",
-        "--variant", "v",
-        "--default",
-    }));
-    // Unknown flag.
-    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
-        "--stub", "s",
-        "--welp", "x",
-    }));
-}
-
-test "compileMatches: rejects unknown bits and mixed forms" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    stdio.init(testing.io);
-
-    // Unknown bit name.
-    try testing.expectError(error.Config, compileMatches(arena, .{
-        .name = "v", .binary = "b", .match = &.{.{ .bit = "TOTALLY_REAL" }},
-    }));
     // Bit form with raw fields set.
     try testing.expectError(error.Config, compileMatches(arena, .{
         .name = "v", .binary = "b",
-        .match = &.{.{ .bit = "SVE2", .mask = 1 }},
+        .match = &.{.{ .bit = .sve2, .mask = 1 }},
     }));
     // Raw form missing expected.
     try testing.expectError(error.Config, compileMatches(arena, .{
         .name = "v", .binary = "b",
-        .match = &.{.{ .source = "hwcap2", .mask = 1 }},
+        .match = &.{.{ .source = .hwcap2, .mask = 1 }},
     }));
     // No form at all.
     try testing.expectError(error.Config, compileMatches(arena, .{
@@ -731,7 +598,7 @@ test "compileMatches: rejects unknown bits and mixed forms" {
     // MIDR source is gated until the stub can read it (step 7).
     try testing.expectError(error.Config, compileMatches(arena, .{
         .name = "v", .binary = "b",
-        .match = &.{.{ .source = "midr", .mask = 1, .expected = 1 }},
+        .match = &.{.{ .source = .midr, .mask = 1, .expected = 1 }},
     }));
 }
 
@@ -791,14 +658,14 @@ test "writeFat: two-variant round-trip through a real file" {
     const machine = @intFromEnum(elf.EM.AARCH64);
     const loaded = [_]LoadedVariant{
         .{
-            .cfg = .{ .name = "v2", .binary = "p0", .match = &.{.{ .bit = "SVE2" }} },
+            .cfg = .{ .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }} },
             .payload = &payload_0,
             .conditions = try compileMatches(arena, .{
-                .name = "v2", .binary = "p0", .match = &.{.{ .bit = "SVE2" }},
+                .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }},
             }),
         },
         .{
-            .cfg = .{ .name = "generic", .binary = "p1", .default = true },
+            .cfg = .{ .name = "generic", .binary = "p1" },
             .payload = &payload_1,
             .conditions = &.{},
         },
