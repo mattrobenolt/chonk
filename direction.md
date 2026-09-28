@@ -198,6 +198,48 @@ idea — worth keeping even though we dropped ZIP itself.
 
 ---
 
+---
+
+## 5a. Build-system integration (shipped 2026-09-27)
+
+`chonk` is consumable as a build dependency. Another project's
+build.zig.zon:
+
+```zig
+.chonk = .{ .path = "../chonk" },
+```
+
+its build.zig:
+
+```zig
+const chonk = b.lazyImport(@This(), "chonk") orelse return;
+_ = chonk.addFatBinary(b, .{
+    .name = "app",
+    .variants = &.{
+        .{ .name = "neoverse-v2", .exe = app_v2, .bit = "SVE2" },
+        .{ .name = "baseline", .exe = app_baseline, .default = true },
+    },
+});
+```
+
+- `b.lazyImport` hands the consumer this repo's build.zig struct —
+  `addFatBinary` runs in-process and wires: the dep's `chonk` CLI as a Run
+  step, the dep's freestanding `stub`, and the consumer's variant
+  executables, then installs `zig-out/bin/<name>` (disable with
+  `install = false`; the fat file's LazyPath is returned either way).
+- Variants travel as CLI flags — `chonk pack --stub F --out F --variant NAME
+  (--bit NAME | --default) FILE` — because build-graph artifact paths resolve
+  only at make time; a ZON config on disk cannot name them. Humans keep the
+  ZON form.
+- One fat binary per architecture: the trailer's machine field is a species
+  check. Cross-arch universal binaries are not possible on Linux — the
+  kernel loads the front ELF as the stub's arch and has no Mach-O-style
+  arch pick; call `addFatBinary` once per arch instead.
+- Working example: `examples/consumer/` — the same app built for
+  neoverse_v2 and baseline, one fat binary out.
+
+---
+
 ## 6. Keeping stub and packer in sync
 
 The trailer struct is the one piece of shared state between a freestanding

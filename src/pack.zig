@@ -92,17 +92,27 @@ const bit_table = std.StaticStringMap(Bit).initComptime(.{
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
 // ---------------------------------------------------------------------------
 
-/// `chonk pack <stub> <config.zon> <output>`. args = everything after the
-/// subcommand word. stdio is initialized by the front door (main.zig).
+/// `chonk pack <stub> <config.zon> <output>` for humans, or the flag form
+/// the build system drives:
+///
+///   chonk pack --stub FILE --out FILE
+///              --variant NAME (--bit NAME | --default) FILE ...
+///
+/// The flag form exists because build-graph artifact paths resolve only
+/// at make time — a ZON config on disk cannot name them. args = everything
+/// after the subcommand word; stdio is initialized by the front door.
 pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
+    const cwd = Io.Dir.cwd();
+
+    if (args.len > 0 and mem.eql(u8, args[0], "--stub")) {
+        const spec = try parseFlagArgs(arena, args);
+        return packAll(io, arena, cwd, cwd, spec.out, spec.stub, spec.config);
+    }
+
     if (args.len != 3) {
         stdio.writeAll(.err, "usage: chonk pack <stub> <config.zon> <output>");
         return error.Usage;
     }
-
-    const cwd = Io.Dir.cwd();
-    const stub = try readFile(io, arena, cwd, args[0]);
-    const stub_machine = (try elfCheck(args[0], stub)).machine;
 
     // Parse the config. ZON errors print with line:column from diag.
     const config_bytes = try readFile(io, arena, cwd, args[1]);
@@ -124,22 +134,124 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     else
         cwd;
 
+    return packAll(io, arena, cwd, config_dir, args[2], args[0], config);
+}
+
+/// The shared tail of both pack forms: read + check the stub, validate the
+/// config, load + compile variants, write the fat binary, report.
+fn packAll(
+    io: Io,
+    arena: Allocator,
+    cwd: Io.Dir,
+    config_dir: Io.Dir,
+    out_path: []const u8,
+    stub_path: []const u8,
+    config: Config,
+) !u8 {
+    const stub = try readFile(io, arena, cwd, stub_path);
+    const stub_machine = (try elfCheck(stub_path, stub)).machine;
+
     try validateConfig(config);
     const loaded = try loadVariants(io, arena, config_dir, config.variants, stub_machine);
 
-    const lay = try writeFat(io, arena, cwd, args[2], stub, stub_machine, loaded);
+    const lay = try writeFat(io, arena, cwd, out_path, stub, stub_machine, loaded);
 
     stdio.print(.out, "packed: {d} variants, total {d}", .{ loaded.len, lay.size });
-    for (loaded, lay.payload_offsets, 0..) |v, offset, i| {
+    for (loaded, lay.payload_offsets) |v, offset| {
         const suffix: []const u8 = if (v.cfg.default) ", default" else "";
         stdio.print(
             .out,
             "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s})",
             .{ v.cfg.name, offset, v.payload.len, v.conditions.len, suffix },
         );
-        _ = i;
     }
     return 0;
+}
+
+/// The flag form's parse result: same shape the ZON path produces.
+const FlagSpec = struct {
+    stub: []const u8,
+    out: []const u8,
+    config: Config,
+};
+
+fn parseFlagArgs(arena: Allocator, args: []const [:0]const u8) !FlagSpec {
+    var stub: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var variants: std.ArrayList(Variant) = .empty;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (mem.eql(u8, arg, "--stub")) {
+            stub = try nextArg("--stub", args, &i);
+        } else if (mem.eql(u8, arg, "--out")) {
+            out = try nextArg("--out", args, &i);
+        } else if (mem.eql(u8, arg, "--variant")) {
+            const name = try nextArg("--variant", args, &i);
+            var bit: ?[]const u8 = null;
+            var is_default = false;
+            while (i + 1 < args.len and isFlag(args[i + 1])) {
+                i += 1;
+                if (mem.eql(u8, args[i], "--bit")) {
+                    bit = try nextArg("--bit", args, &i);
+                } else if (mem.eql(u8, args[i], "--default")) {
+                    is_default = true;
+                } else {
+                    return usageFail("unknown variant flag '{s}'", .{args[i]});
+                }
+            }
+            if (bit != null and is_default) {
+                return usageFail("variant '{s}' is both --bit and --default", .{name});
+            }
+            if (bit == null and !is_default) {
+                return usageFail("variant '{s}' needs --bit NAME or --default", .{name});
+            }
+            if (i + 1 >= args.len) {
+                return usageFail("variant '{s}' needs its payload path last", .{name});
+            }
+            i += 1;
+            const match: []const Match = if (bit) |bit_name| blk: {
+                const m = try arena.create(Match);
+                m.* = .{ .bit = bit_name };
+                break :blk m[0..1];
+            } else &.{};
+            try variants.append(arena, .{
+                .name = name,
+                .binary = args[i],
+                .match = match,
+                .default = is_default,
+            });
+        } else {
+            return usageFail("unknown argument '{s}'", .{arg});
+        }
+    }
+
+    if (stub == null) return usageFail("--stub is required", .{});
+    if (out == null) return usageFail("--out is required", .{});
+    if (variants.items.len == 0) return usageFail("at least one --variant is required", .{});
+
+    return .{
+        .stub = stub.?,
+        .out = out.?,
+        .config = .{ .variants = try variants.toOwnedSlice(arena) },
+    };
+}
+
+fn isFlag(arg: []const u8) bool {
+    return arg.len >= 3 and mem.startsWith(u8, arg, "--");
+}
+
+fn nextArg(comptime flag: []const u8, args: []const [:0]const u8, i: *usize) ![]const u8 {
+    if (i.* + 1 >= args.len) return usageFail("{s} needs a value", .{flag});
+    i.* += 1;
+    return args[i.*];
+}
+
+/// Report a flag-form usage problem — mapped to exit 2 by the front door.
+fn usageFail(comptime fmt: []const u8, args: anytype) error{Usage} {
+    stdio.print(.err, "chonk: " ++ fmt, args);
+    return error.Usage;
 }
 
 /// Config-level checks that need no filesystem: variant count, exactly one
@@ -520,6 +632,69 @@ test "compileMatches: bit name implies source and expected" {
     try testing.expectEqual(@as(u64, 1 << 1), conditions[0].mask);
     try testing.expectEqual(@as(u64, 1 << 1), conditions[0].expected);
     try testing.expectEqual(format.Source.hwcap2, conditions[0].source);
+}
+
+test "flag args parse to a valid config" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    stdio.init(testing.io);
+
+    const argv = [_][:0]const u8{
+        "--stub",      "stub-path",
+        "--out",       "out-path",
+        "--variant",   "neoverse-v2",
+        "--bit",       "SVE2",
+        "bin/app-v2",
+        "--variant",   "generic",
+        "--default",
+        "bin/app-generic",
+    };
+    const spec = try parseFlagArgs(arena, &argv);
+    try testing.expectEqualStrings("stub-path", spec.stub);
+    try testing.expectEqualStrings("out-path", spec.out);
+    try testing.expectEqual(@as(usize, 2), spec.config.variants.len);
+    try testing.expectEqualStrings("neoverse-v2", spec.config.variants[0].name);
+    try testing.expectEqualStrings("SVE2", spec.config.variants[0].match[0].bit.?);
+    try testing.expect(spec.config.variants[1].default);
+
+    // The synthesized config flows through the normal pipeline.
+    try validateConfig(spec.config);
+    const conditions = try compileMatches(arena, spec.config.variants[0]);
+    try testing.expectEqual(@as(u64, 1 << 1), conditions[0].mask);
+    try testing.expectEqual(format.Source.hwcap2, conditions[0].source);
+}
+
+test "flag args reject malformed forms" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    stdio.init(testing.io);
+
+    // Missing --stub.
+    try testing.expectError(
+        error.Usage,
+        parseFlagArgs(arena, &[_][:0]const u8{ "--out", "o" }),
+    );
+    // Variant with no matcher.
+    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
+        "--stub",    "s",
+        "--out",     "o",
+        "--variant", "v",
+        "bin/x",
+    }));
+    // Variant missing its payload path.
+    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
+        "--stub",    "s",
+        "--out",     "o",
+        "--variant", "v",
+        "--default",
+    }));
+    // Unknown flag.
+    try testing.expectError(error.Usage, parseFlagArgs(arena, &[_][:0]const u8{
+        "--stub", "s",
+        "--welp", "x",
+    }));
 }
 
 test "compileMatches: rejects unknown bits and mixed forms" {
