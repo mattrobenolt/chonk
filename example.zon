@@ -28,9 +28,8 @@
             },
         },
 
-        // The fallback: the one variant with no match.
+        // The fallback: no match, no name — display metadata is optional.
         .{
-            .name = "generic",
             .binary = "/run/current-system/sw/bin/true",
         },
     },

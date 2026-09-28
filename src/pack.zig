@@ -38,8 +38,12 @@ pub const Config = struct {
 };
 
 pub const Variant = struct {
-    /// Display name — must be unique; `inspect` will show it.
-    name: []const u8,
+    /// Display name — pure metadata, never on the wire, never read by the
+    /// stub. Defaults to the payload basename; duplicates among EXPLICIT
+    /// names are rejected (derived ones may collide legally: two variants
+    /// pointing at the same payload with different conditions is the OR
+    /// pattern).
+    name: ?[]const u8 = null,
     /// Payload binary path, relative to the config file's directory.
     binary: []const u8,
     /// Conditions ANDed together. First variant in file order whose
@@ -153,7 +157,8 @@ pub fn packAll(
     const stub_machine = (try elfCheck(stub_path, stub)).machine;
 
     try validateConfig(config);
-    const loaded = try loadVariants(io, arena, config_dir, config.variants, stub_machine);
+    const named = try normalizeConfig(arena, config);
+    const loaded = try loadVariants(io, arena, config_dir, named, stub_machine);
 
     const lay = try writeFat(io, arena, cwd, out_path, stub, stub_machine, loaded);
 
@@ -185,16 +190,37 @@ fn validateConfig(config: Config) !void {
     }
     for (config.variants, 0..) |a, i| {
         for (config.variants[i + 1 ..]) |b| {
-            if (mem.eql(u8, a.name, b.name)) {
-                return configFail("duplicate variant name '{s}'", .{a.name});
+            if (a.name != null and b.name != null and mem.eql(u8, a.name.?, b.name.?)) {
+                return configFail("duplicate variant name '{s}'", .{a.name.?});
             }
         }
     }
 }
 
+/// Variant after normalization — the display name is guaranteed.
+const NamedVariant = struct {
+    name: []const u8,
+    binary: []const u8,
+    match: []const Match,
+};
+
+/// Fill optional names with derived ones — the payload basename. Display
+/// only; downstream error messages and reports read better with a name.
+fn normalizeConfig(arena: Allocator, config: Config) Allocator.Error![]NamedVariant {
+    const variants = try arena.alloc(NamedVariant, config.variants.len);
+    for (config.variants, 0..) |v, i| {
+        variants[i] = .{
+            .name = v.name orelse fs_path.basename(v.binary),
+            .binary = v.binary,
+            .match = v.match,
+        };
+    }
+    return variants;
+}
+
 /// One validated variant: config + payload bytes + compiled conditions.
 const LoadedVariant = struct {
-    cfg: Variant,
+    cfg: NamedVariant,
     payload: []const u8,
     conditions: []const format.Condition,
 };
@@ -203,7 +229,7 @@ fn loadVariants(
     io: Io,
     arena: Allocator,
     config_dir: Io.Dir,
-    variants: []const Variant,
+    variants: []const NamedVariant,
     stub_machine: u16,
 ) ![]LoadedVariant {
     const loaded = try arena.alloc(LoadedVariant, variants.len);
@@ -227,7 +253,7 @@ fn loadVariants(
 
 /// Translate config matches into wire conditions. Every failure is a
 /// config error with the variant's name attached.
-fn compileMatches(arena: Allocator, v: Variant) ![]const format.Condition {
+fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
     const out = try arena.alloc(format.Condition, v.match.len);
     for (v.match, 0..) |m, i| {
         if (m.bit) |bit| {
@@ -508,8 +534,9 @@ test "config parses from ZON" {
         \\        .{ .bit = .sve2 },
         \\        .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 },
         \\    } },
-        \\    // The fallback: no match at all.
-        \\    .{ .name = "generic", .binary = "bin/app-generic" },
+        \\    // The fallback: no match at all, and no name — it derives
+        \\    // from the payload basename.
+        \\    .{ .binary = "bin/app-generic" },
         \\} }
     ;
     const buf = try arena.allocSentinel(u8, source.len, 0);
@@ -523,12 +550,18 @@ test "config parses from ZON" {
     };
 
     try testing.expectEqual(@as(usize, 2), config.variants.len);
-    try testing.expectEqualStrings("neoverse-v2", config.variants[0].name);
+    try testing.expectEqualStrings("neoverse-v2", config.variants[0].name.?);
     try testing.expectEqual(@as(usize, 2), config.variants[0].match.len);
     try testing.expectEqual(Bit.sve2, config.variants[0].match[0].bit.?);
     try testing.expectEqual(format.Source.hwcap, config.variants[0].match[1].source.?);
-    // No match = the fallback.
+    // No match = the fallback; no name in the file = null until derived.
+    try testing.expect(config.variants[1].name == null);
     try testing.expectEqual(@as(usize, 0), config.variants[1].match.len);
+
+    // Normalization fills the derived name (payload basename).
+    const named = try normalizeConfig(arena, config);
+    try testing.expectEqualStrings("app-generic", named[1].name);
+    try testing.expectEqualStrings("neoverse-v2", named[0].name);
 }
 
 test "compileMatches: bit name implies source and expected" {
@@ -537,7 +570,7 @@ test "compileMatches: bit name implies source and expected" {
     const arena = arena_state.allocator();
     stdio.init(testing.io);
 
-    const v: Variant = .{
+    const v: NamedVariant = .{
         .name = "v2",
         .binary = "bin/app-v2",
         .match = &.{.{ .bit = .sve2 }},
@@ -665,7 +698,7 @@ test "writeFat: two-variant round-trip through a real file" {
             }),
         },
         .{
-            .cfg = .{ .name = "generic", .binary = "p1" },
+            .cfg = .{ .name = "generic", .binary = "p1", .match = &.{} },
             .payload = &payload_1,
             .conditions = &.{},
         },
