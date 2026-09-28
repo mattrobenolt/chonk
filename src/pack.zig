@@ -336,7 +336,7 @@ fn configFail(comptime fmt: []const u8, args: anytype) error{Config} {
 
 /// Read a whole file. Logs the path on failure — "error.FileNotFound" with
 /// no path is hostile from a CLI.
-fn readFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8) ![]u8 {
+pub fn readFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8) ![]u8 {
     var file = dir.openFile(io, path, .{}) catch |err| {
         logFail(path, "open", err);
         return err;

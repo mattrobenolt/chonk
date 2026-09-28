@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const stringToEnum = std.meta.stringToEnum;
 
+const inspect = @import("inspect.zig");
 const pack = @import("pack.zig");
 const stdio = @import("stdio.zig");
 
@@ -36,10 +37,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return if (err == error.Usage) 2 else 1;
             };
         },
-        .inspect => {
-            stdio.writeAll(.err, "chonk: inspect: not implemented yet\n");
-            return 2;
-        },
+        .inspect => return inspect.run(io, arena, rest),
     }
 }
 
@@ -56,4 +54,5 @@ fn usageExit() u8 {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("inspect.zig");
 }
