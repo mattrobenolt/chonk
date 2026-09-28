@@ -104,12 +104,60 @@ The call does the rest:
   always `ReleaseSmall` and stripped.
 - It packs everything in-process — the same module the CLI uses — and
   returns the fat file as a `LazyPath`.
+- It runs `post_process` per variant, when set, and packs what it returns
+  (see below).
 
 The fat binary installs to `zig-out/bin/<name>`. Set `install` to `false`
 and wire your own install step when the fat binary must stay off the
 default install. `examples/consumer` shows the full pattern: `zig build`
 builds the normal native binary, and `zig build chonk` builds the release
 fleet.
+
+To rewrite each payload between its compile and the pack, set
+`post_process`. chonk calls it once per variant with the emitted binary;
+the returned path is what gets packed, and the pack waits on whatever
+step produces it:
+
+```zig
+fn postProcess(b: *Build, v: chonk.Variant, payload: LazyPath) LazyPath {
+    _ = v;
+    // copy first — patchelf rewrites in place
+    const run = b.addSystemCommand(&.{ "bash", "-c",
+        "cp \"$1\" \"$2\" && patchelf --set-interpreter " ++
+        "/run/current-system/sw/bin/ld-linux-aarch64.so.1 \"$2\"" });
+    run.addFileArg(payload);
+    return run.addOutputFileArg("payload-patched");
+}
+```
+
+`patchelf` the interpreter, force old dtags, sign, or compress — whatever
+runs between compile and pack. Return `payload` unchanged for the
+variants that need nothing.
+
+### Dynamically linked payloads on NixOS
+
+A payload that links a shared library hits a NixOS trap that looks like
+a chonk bug. A variant built from a non-native `std.Target.Query` gets
+zig's glibc-stub interpreter, `/lib/ld-linux-<arch>.so.1`. On NixOS that
+path is nix-ld, and nix-ld resolves libraries through
+`NIX_LD_LIBRARY_PATH`, which the system points at nixpkgs builds.
+`LD_LIBRARY_PATH` is searched before `DT_RUNPATH`, so the payload binds
+the nixpkgs library instead of the one its rpath names, and dies at
+first use with an undefined symbol.
+
+Verified against zig 0.16, neither of these fixes it:
+`linker_enable_new_dtags = false` — the driver accepts `--disable-new-dtags`
+and never forwards it to lld, so the payload always carries `DT_RUNPATH` —
+and `query.dynamic_linker` pointing at the real loader — it propagates
+into the glibc sub-compilations, which fail with
+`ObjectFilesCannotSpecifyDynamicLinker`.
+
+What works: run the fat binary with `LD_LIBRARY_PATH` naming the right
+library's directory, or bake an rpath on the payload's module
+(`root_module.addRPath`) and accept that nix-ld still wins when its
+directory holds the same soname. The complete fix is a `post_process` hook
+that `patchelf --set-interpreter`s each payload to the host's real
+loader — the rewrite runs between compile and pack, where it belongs.
 
 ## Cloud coverage
 

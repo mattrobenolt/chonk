@@ -139,7 +139,20 @@ pub const Variant = struct {
 /// executable `v.name`; chonk never installs it.
 pub const ExeFactory = *const fn (b: *Build, v: Variant) *Step.Compile;
 
+/// The consumer's per-payload post-processor (#5): same Variant as the
+/// factory gets, plus the compiled payload. Wire a Run step (patchelf,
+/// strip, objcopy, signing) that consumes `payload` and return its output;
+/// the pack depends on the returned path's producer automatically.
+pub const PostProcess = *const fn (b: *Build, v: Variant, payload: LazyPath) LazyPath;
+
 pub const ExecutableOptions = struct {
+    /// Optional per-payload post-processor (#5): called once per variant
+    /// after its compile, with the emitted binary; the returned LazyPath is
+    /// what gets packed. patchelf the interpreter (the NixOS loader trap),
+    /// force old dtags, sign, or compress — the hook owns the payload
+    /// between compile and pack. Return `payload` unchanged to pass
+    /// through.
+    post_process: ?PostProcess = null,
     /// The fat binary's name — the ONLY name. Installed as
     /// zig-out/bin/<name>; intermediates auto-name from their CPU models.
     name: []const u8,
@@ -325,12 +338,24 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
     });
     stub.entry = .enabled;
 
+    // The post-compile hook (#5): called once per variant with what
+    // make_exe/root_source_file built; the returned LazyPath is what gets
+    // packed. A Run-step output rewrites the payload between compile and
+    // pack; `payload` passes through unchanged.
     const pack_step = b.allocator.create(PackStep) catch @panic("OOM");
     const inputs = b.allocator.alloc(PackStep.Input, variants.len) catch @panic("OOM");
     for (variants, 0..) |t, i| {
+        var payload = exes[i].getEmittedBin();
+        if (options.post_process) |post| {
+            payload = post(b, .{
+                .name = t.name,
+                .target = t.resolved,
+                .optimize = options.optimize,
+            }, payload);
+        }
         inputs[i] = .{
             .name = t.name,
-            .payload = exes[i].getEmittedBin(),
+            .payload = payload,
             .match = t.match,
         };
     }
@@ -347,10 +372,18 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         .inputs = inputs,
     };
 
-    // The pack runs after the stub + every variant compiles.
+    // The pack runs after the stub + every variant compiles + every
+    // hook output's producer. LazyPath carries no step accessor in 0.16,
+    // so pull the producer off the generated tag; static paths have no
+    // producer.
     pack_step.step.dependOn(&stub.step);
     for (exes) |exe| {
         pack_step.step.dependOn(&exe.step);
+    }
+    for (inputs) |input| {
+        if (producerStep(input.payload)) |producer| {
+            pack_step.step.dependOn(producer);
+        }
     }
 
     const fat: LazyPath = .{ .generated = .{ .file = &pack_step.fat } };
@@ -361,6 +394,16 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         b.getInstallStep().dependOn(&install.step);
     }
     return fat;
+}
+
+/// The step that produces a LazyPath, for generated paths; static paths
+/// (src, cwd, dependency) have no producer — the file exists by pack time
+/// or the pack fails.
+fn producerStep(payload: LazyPath) ?*Step {
+    return switch (payload) {
+        .generated => |g| g.file.step,
+        else => null,
+    };
 }
 
 /// Packs a fat binary in-process: the same module the CLI uses, run by the

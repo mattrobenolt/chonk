@@ -164,6 +164,11 @@ factory:
         .paths = .{ "build.zig", "build.zig.zon", "src" },
     }
     ZON
+    # The post-compile hook test payload: a copied host bash. The hook
+    # swaps the baseline variant's compiled binary for it, so a host where
+    # nothing matches dispatches to bash and prints TIER-hook — proving the
+    # PACKED bytes came from the hook's return, not the compile.
+    cp "$(command -v bash)" tracer
     cat > build.zig <<ZIG
     const std = @import("std");
     const Build = std.Build;
@@ -176,11 +181,19 @@ factory:
             .optimize = .Debug,
             .install = true,
             .make_exe = makeExe,
+            .post_process = postProcess,
             .targets = &.{
                 .{ .model = .{ .explicit = &std.Target.aarch64.cpu.neoverse_v2 } },
             },
         });
         _ = fat;
+    }
+
+    fn postProcess(b: *Build, v: chonk.Variant, payload: Build.LazyPath) Build.LazyPath {
+        // The baseline packs a copied bash (the recipe copies it in as
+        // `tracer` before zig build); other variants pass through.
+        if (std.mem.eql(u8, v.name, "generic")) return b.path("tracer");
+        return payload;
     }
 
     fn makeExe(b: *Build, v: chonk.Variant) *Build.Step.Compile {
@@ -220,8 +233,18 @@ factory:
     }
     ZIG
     zig build --summary all
-    ./zig-out/bin/app | grep -q "factory-helper built for neoverse_v2\|factory-helper built for generic"
-    echo "ok: factory (dependency import + exe flags through make_exe)"
+    # sve2-class hosts match the v2 tier (factory-helper); N1-class hosts
+    # hit the hooked baseline and print TIER-hook. A hook silently ignored
+    # prints "factory-helper built for generic" — and fails this grep.
+    ./zig-out/bin/app -c 'echo TIER-hook' \
+        | grep -q "factory-helper built for neoverse_v2\|TIER-hook"
+    # The hooked-baseline path, forced: qemu's synthesized auxv has no SVE
+    # under -cpu neoverse-n1, so the baseline — the hook's swapped bash —
+    # dispatches. This is the leg that proves the packed bytes are the
+    # hook's return, on every host, not just no-SVE CI runners.
+    timeout 60 qemu-aarch64 -cpu neoverse-n1 ./zig-out/bin/app -c 'echo TIER-hook' \
+        | grep -q "TIER-hook"
+    echo "ok: factory (make_exe dependency import + post_process payload swap)"
 
 # CLI door on x86_64: pack a CPUID-conditioned fat (AVX2 tier + fallback)
 # with the x86_64 stub, inspect it, dispatch NATIVELY (the legs this
