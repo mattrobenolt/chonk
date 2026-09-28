@@ -83,22 +83,22 @@ cp -f "$(command -v bash)" tests/e2e/bash
 # --- CLI door: pack-cli.zon --------------------------------------------------
 # Dedup shape: v1 and the fallback share the copied bash. Tracers: sve2
 # tier → chonk usage (exit 2), sve tier → bash marker, fallback → bash
-# marker.
+# marker. The fixture packs the aarch64 stub with host-arch payloads —
+# an aarch64-host leg; the x86 battery has its own CLI door.
 
-run ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 \
-    tests/e2e/pack-cli.zon .zig-cache/e2e/pack-cli-fat
-expect_out "3 variants (2 unique payload(s))" "pack-cli pack (dedup)"
-expect_rc 0 "pack-cli pack"
-
-run ./zig-out/bin/chonk inspect .zig-cache/e2e/pack-cli-fat
-expect_out "machine aarch64, 3 variants" "pack-cli inspect"
-expect_rc 0 "pack-cli inspect"
-
-# Native dispatch: whichever tier the host's advertised features select —
-# tolerant because hosts differ (sve2 hw → the chonk tracer; GitHub's arm
-# runners → the bash fallback). aarch64 fat binaries do not exec on x86_64
-# hosts at all (the emulation wall) — the x86 battery covers that side.
 if [ "$arch" = aarch64 ]; then
+    run ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 \
+        tests/e2e/pack-cli.zon .zig-cache/e2e/pack-cli-fat
+    expect_out "3 variants (2 unique payload(s))" "pack-cli pack (dedup)"
+    expect_rc 0 "pack-cli pack"
+
+    run ./zig-out/bin/chonk inspect .zig-cache/e2e/pack-cli-fat
+    expect_out "machine aarch64, 3 variants" "pack-cli inspect"
+    expect_rc 0 "pack-cli inspect"
+
+    # Native dispatch: whichever tier the host's advertised features select
+    # — tolerant because hosts differ (sve2 hw → the chonk tracer; GitHub's
+    # arm runners → the bash fallback).
     run .zig-cache/e2e/pack-cli-fat -c 'echo TIER-v1-bash'
     case "$out" in
         *"usage: chonk"* | *"TIER-v1-bash"*) ok "pack-cli native dispatch (rc=$rc)" ;;
@@ -106,7 +106,7 @@ if [ "$arch" = aarch64 ]; then
     esac
     expect_rc_any "0 2" "pack-cli native dispatch rc"
 else
-    skip "pack-cli native dispatch (aarch64 fat needs an aarch64 host)"
+    skip "pack-cli (aarch64 CLI door; needs an aarch64 host)"
 fi
 
 # --- consumer example --------------------------------------------------------
@@ -123,8 +123,14 @@ zig build run | grep -q "app built for CPU model" || { fail "consumer run step";
 zig build chonk
 popd >/dev/null
 
-run ./examples/consumer/zig-out/bin/app
-expect_out "app built for CPU model: neoverse" "consumer native dispatch (tolerant: host tier)"
+# Native dispatch of the aarch64 fleet fat — aarch64 hosts only (the
+# chonk fleet overwrites zig-out/bin/app with the aarch64 fat).
+if [ "$arch" = aarch64 ]; then
+    run ./examples/consumer/zig-out/bin/app
+    expect_out "app built for CPU model: neoverse" "consumer native dispatch (tolerant: host tier)"
+else
+    skip "consumer native dispatch (aarch64 fat needs an aarch64 host)"
+fi
 run ./zig-out/bin/chonk inspect examples/consumer/zig-out/bin/app
 expect_out "machine aarch64, 5 variants" "consumer inspect (aarch64 fleet)"
 run ./zig-out/bin/chonk inspect examples/consumer/zig-out/bin/app-x86_64
@@ -134,37 +140,39 @@ expect_out "machine x86_64, 2 variants" "consumer inspect (x86_64 fleet)"
 # Controlled CPU identities: qemu max (sve2), neoverse-v1 (sve, no sve2),
 # neoverse-n1 (base word only — qemu's n1 does not advertise sve), and
 # cortex-a72 (nothing). bash echoes a marker; chonk prints usage (exit 2).
-
-run ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 \
-    tests/e2e/tiers.zon .zig-cache/e2e/fat-tiers
-expect_rc 0 "tiers pack"
+# The fixture packs the aarch64 stub with host-arch payloads — an
+# aarch64-host leg, whole section.
 
 if [ "$arch" = aarch64 ]; then
+    run ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 \
+        tests/e2e/tiers.zon .zig-cache/e2e/fat-tiers
+    expect_rc 0 "tiers pack"
+
     run .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
     case "$out" in
         *"TIER-v2-bash"* | *"TIER-v1-bash"* | *"usage: chonk"*) ok "tiers native (host hw dispatch, rc=$rc)" ;;
         *) fail "tiers native dispatch (unexpected output)" ;;
     esac
     expect_rc_any "0 2" "tiers native rc"
+
+    run qemu-aarch64 -cpu max .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
+    expect_out "TIER-v2-bash" "tiers qemu max (first-match: sve2 beats sve)"
+    expect_rc 0 "tiers qemu max"
+
+    run qemu-aarch64 -cpu neoverse-v1 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
+    expect_out "TIER-v2-bash" "tiers qemu neoverse-v1 (v1 tier, bash tracer)"
+    expect_rc 0 "tiers qemu neoverse-v1"
+
+    run qemu-aarch64 -cpu neoverse-n1 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
+    expect_out "usage: chonk" "tiers qemu neoverse-n1 (fallback: no sve advertised)"
+    expect_rc 2 "tiers qemu neoverse-n1"
+
+    run qemu-aarch64 -cpu cortex-a72 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
+    expect_out "usage: chonk" "tiers qemu cortex-a72 (fallback, chonk tracer)"
+    expect_rc 2 "tiers qemu cortex-a72"
 else
-    skip "tiers native (aarch64 fat needs an aarch64 host)"
+    skip "tiers (aarch64 tier matrix; needs an aarch64 host)"
 fi
-
-run qemu-aarch64 -cpu max .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
-expect_out "TIER-v2-bash" "tiers qemu max (first-match: sve2 beats sve)"
-expect_rc 0 "tiers qemu max"
-
-run qemu-aarch64 -cpu neoverse-v1 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
-expect_out "TIER-v2-bash" "tiers qemu neoverse-v1 (v1 tier, bash tracer)"
-expect_rc 0 "tiers qemu neoverse-v1"
-
-run qemu-aarch64 -cpu neoverse-n1 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
-expect_out "usage: chonk" "tiers qemu neoverse-n1 (fallback: no sve advertised)"
-expect_rc 2 "tiers qemu neoverse-n1"
-
-run qemu-aarch64 -cpu cortex-a72 .zig-cache/e2e/fat-tiers -c 'echo TIER-v2-bash'
-expect_out "usage: chonk" "tiers qemu cortex-a72 (fallback, chonk tracer)"
-expect_rc 2 "tiers qemu cortex-a72"
 
 # --- x86_64 selection paths: strace under qemu --------------------------------
 # Both CPU identities select a payload (different sendfile sizes), and the
