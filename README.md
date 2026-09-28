@@ -243,11 +243,11 @@ stubs refuse new trailers at run time.
 ## Development
 
 `nix develop` supplies Zig 0.16, `just`, and qemu-user. `just` runs the
-full e2e battery for whatever host it runs on: both pack doors, the qemu
-tier matrix, the make_exe factory, and the error paths. `just e2e-x86`
-runs the x86_64 legs natively on an x86_64 host; elsewhere those legs
-skip. CI runs both species on every push, an `ubuntu-24.04-arm` job and
-an `ubuntu-24.04` job, so a full native dispatch on each architecture is
+full e2e battery — `tests/e2e.sh`, a plain bash script: both pack doors,
+the qemu tier matrix, the factory example, and the error paths. The host
+arch picks the native legs; the qemu legs run everywhere. CI runs the
+battery on both species on every push, an `ubuntu-24.04-arm` job and an
+`ubuntu-24.04` job, so a full native dispatch on each architecture is
 verified continuously.
 
 Use `-cpu` models to verify dispatch under controlled CPU identities:

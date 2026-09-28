@@ -39,13 +39,12 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      # The full aarch64 battery. NOTE: GitHub arm runners are Ampere
-      # Altra (Neoverse N1) — NO SVE — so the native dispatch legs select
-      # lower tiers than an sve-capable host; the tolerant assertions
-      # accept the known tier set. The qemu legs carry the deterministic
-      # matrix; the factory's implicit baseline covers the no-sve case.
-      - name: Full aarch64 e2e battery
-        run: nix develop --command just e2e-arm
+      # The full battery (tests/e2e.sh) — the host arch picks the native
+      # legs, the qemu legs run everywhere. The native aarch64 dispatch
+      # tiers depend on the runner's silicon (the pool is not all
+      # no-SVE Altra); the tolerant assertions accept the known set.
+      - name: Full e2e battery (aarch64 host)
+        run: nix develop --command just test
 
   test-x86:
     name: e2e x86_64 (native dispatch — the wall's other side)
@@ -60,9 +59,9 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      # The x86_64 battery: the full native dispatch path that the
-      # aarch64 dev box cannot run (qemu hands foreign-arch execveat to
-      # the host kernel — the errno 8 wall). This runner runs it for
-      # real: the CPUID conditions select a tier on real x86 hardware.
-      - name: Full x86_64 e2e battery
-        run: nix develop --command just e2e-x86
+      # The same battery on an x86_64 host: the native legs run the full
+      # dispatch path that the aarch64 dev box cannot run (qemu hands
+      # foreign-arch execveat to the host kernel — the errno 8 wall).
+      # The CPUID conditions select a tier on real x86 hardware.
+      - name: Full e2e battery (x86_64 host)
+        run: nix develop --command just test
