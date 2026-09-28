@@ -20,10 +20,11 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const elf = std.elf;
 const fs_path = std.fs.path;
+const assert = std.debug.assert;
+const zon = std.zon;
 
 const format = @import("format.zig");
 const stdio = @import("stdio.zig");
-const zon = std.zon;
 
 /// Not a format rule — a refusal to concatenate something absurd.
 const max_file_size: u64 = 1 << 30;
@@ -120,7 +121,7 @@ pub const x86_table = [_]X86Entry{
 comptime {
     for (x86_table, 0..) |a, i| {
         for (x86_table[i + 1 ..]) |b| {
-            std.debug.assert(a.feature != b.feature);
+            assert(a.feature != b.feature);
         }
     }
 }
@@ -222,10 +223,10 @@ pub const aarch64_table = [_]Aarch64Entry{
 
 comptime {
     // Every Bit tag: exactly one table entry.
-    std.debug.assert(aarch64_table.len == std.enums.values(Bit).len);
+    assert(aarch64_table.len == std.enums.values(Bit).len);
     for (aarch64_table, 0..) |a, i| {
         for (aarch64_table[i + 1 ..]) |b| {
-            std.debug.assert(a.bit != b.bit);
+            assert(a.bit != b.bit);
         }
     }
 }
@@ -770,21 +771,26 @@ test "compileMatches: rejects mixed and incomplete forms" {
 
     // Bit form with raw fields set.
     try testing.expectError(error.Config, compileMatches(arena, .{
-        .name = "v", .binary = "b",
+        .name = "v",
+        .binary = "b",
         .match = &.{.{ .bit = .sve2, .mask = 1 }},
     }));
     // Raw form missing expected.
     try testing.expectError(error.Config, compileMatches(arena, .{
-        .name = "v", .binary = "b",
+        .name = "v",
+        .binary = "b",
         .match = &.{.{ .source = .hwcap2, .mask = 1 }},
     }));
     // No form at all.
     try testing.expectError(error.Config, compileMatches(arena, .{
-        .name = "v", .binary = "b", .match = &.{.{}},
+        .name = "v",
+        .binary = "b",
+        .match = &.{.{}},
     }));
     // MIDR source is gated until the stub can read it (step 7).
     try testing.expectError(error.Config, compileMatches(arena, .{
-        .name = "v", .binary = "b",
+        .name = "v",
+        .binary = "b",
         .match = &.{.{ .source = .midr, .mask = 1, .expected = 1 }},
     }));
 }
@@ -848,7 +854,9 @@ test "writeFat: two-variant round-trip through a real file" {
             .cfg = .{ .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }} },
             .payload = &payload_0,
             .conditions = try compileMatches(arena, .{
-                .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }},
+                .name = "v2",
+                .binary = "p0",
+                .match = &.{.{ .bit = .sve2 }},
             }),
         },
         .{
