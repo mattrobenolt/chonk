@@ -220,15 +220,16 @@ if [ "$arch" = aarch64 ]; then
         *"factory-helper built for neoverse_v2"* | *"fallback build"*) ok "factory native (host hw dispatch)" ;;
         *) fail "factory native dispatch (unexpected output)" ;;
     esac
+    # The hooked fallback, forced: qemu's synthesized auxv has no SVE under
+    # -cpu neoverse-n1, so the baseline — the hook's swapped binary —
+    # dispatches. Same-arch execveat passes to the host kernel and works;
+    # on an x86_64 host it hits the wall (the x86-select lesson, mirrored).
+    run qemu-aarch64 -cpu neoverse-n1 ./examples/factory/zig-out/bin/app
+    expect_out "post-processed payload" "factory qemu n1 (the hook's return packed)"
+    expect_rc 0 "factory qemu n1"
 else
     skip "factory native (aarch64 fat needs an aarch64 host)"
 fi
-# The hooked fallback, forced: qemu's synthesized auxv has no SVE under
-# -cpu neoverse-n1, so the baseline — the hook's swapped binary —
-# dispatches, on every host.
-run qemu-aarch64 -cpu neoverse-n1 ./examples/factory/zig-out/bin/app
-expect_out "post-processed payload" "factory qemu n1 (the hook's return packed)"
-expect_rc 0 "factory qemu n1"
 
 # --- x86_64 CLI door: pack-cli-x86.zon -----------------------------------------
 # AVX2-conditioned tier plus the fallback, both the copied bash — one
