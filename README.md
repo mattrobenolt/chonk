@@ -111,7 +111,9 @@ The fat binary installs to `zig-out/bin/<name>`. Set `install` to `false`
 and wire your own install step when the fat binary must stay off the
 default install. `examples/consumer` shows the full pattern: `zig build`
 builds the normal native binary, and `zig build chonk` builds the release
-fleet.
+fleet. `examples/factory` shows `make_exe` with a dependency module
+import and a `post_process` hook that swaps the fallback variant's payload
+for a different binary.
 
 To rewrite each payload between its compile and the pack, set
 `post_process`. chonk calls it once per variant with the emitted binary;

@@ -1,0 +1,8 @@
+// The x86_64 CLI-door fixture: an AVX2-conditioned tier plus the
+// fallback, both the copied bash — one payload byte set, the dedup shape.
+// Payload paths resolve against this file's directory.
+.{ .variants = .{
+    .{ .name = "avx2", .binary = "bash",
+       .match = .{ .{ .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } } } },
+    .{ .binary = "bash" },
+} }

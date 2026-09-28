@@ -1,0 +1,7 @@
+// The tier-matrix fixture: distinct tracers per tier. bash echoes a
+// marker; chonk prints usage (exit 2) — the fallback tracer.
+.{ .variants = .{
+    .{ .name = "v2-tier", .binary = "bash", .match = .{ .{ .bit = .sve2 } } },
+    .{ .name = "v1-tier", .binary = "bash", .match = .{ .{ .bit = .sve } } },
+    .{ .binary = "../../zig-out/bin/chonk" },
+} }

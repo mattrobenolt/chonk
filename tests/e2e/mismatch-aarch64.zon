@@ -1,0 +1,6 @@
+// The machine-mismatch fixture, aarch64 host: pack with stub-aarch64,
+// payload is the x86_64 stub — the cheapest portable wrong-species
+// payload, since both stubs are always cross-built.
+.{ .variants = .{
+    .{ .binary = "../../zig-out/bin/stub-x86_64" },
+} }

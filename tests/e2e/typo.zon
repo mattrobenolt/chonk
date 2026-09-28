@@ -1,0 +1,8 @@
+// The parse-error fixture: a bit name the enum does not carry. Parsing
+// fails with line:column before any payload is opened — the binary paths
+// are inert.
+.{ .variants = .{
+    .{ .name = "x", .binary = "bash",
+       .match = .{ .{ .bit = .totally_real } } },
+    .{ .binary = "bash" },
+} }

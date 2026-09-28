@@ -21,8 +21,20 @@ build:
     ziglint src/ build.zig
     @echo "ok: build"
 
+# The host bash copied to the fixed path the ZON fixtures in tests/e2e
+# reference — host bash paths differ (NixOS vs Ubuntu), so the fixtures
+# stay static and this copy normalizes the path. tests/e2e/bash is
+# gitignored.
+bash-bin:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p .zig-cache/e2e tests/e2e
+    # -f: the copied bash is mode 555 (NixOS store path), so a second
+    # copy onto the existing read-only file needs the unlink-first.
+    cp -f "$(command -v bash)" tests/e2e/bash
+
 # The complete aarch64 battery: both pack doors, the qemu tier matrix,
-# the x86 selection paths under qemu, the make_exe factory, the error
+# the x86 selection paths under qemu, the factory example, the error
 # paths. Host dispatch legs assume an sve-capable aarch64 host (any
 # Neoverse V1+; on GitHub's N1 runners the legs dispatch lower tiers —
 # the tolerant assertions cover both).
@@ -33,22 +45,14 @@ e2e-arm: build pack-cli consumer tiers x86-select factory errors
 # dispatch legs skip on non-x86_64 hosts.
 e2e-x86: build pack-cli-x86 consumer-x86 errors
 
-# CLI door: pack a generated config (dedup: v1 + fallback share the bash
-# binary), inspect it, dispatch. Tracers: sve2 tier → chonk usage (exit 2),
-# sve tier → bash marker, fallback → bash marker.
-pack-cli:
+# CLI door: pack the tests/e2e/pack-cli.zon fixture (dedup: v1 and the
+# fallback share the copied bash), inspect it, dispatch. Tracers: sve2
+# tier → chonk usage (exit 2), sve tier → bash marker, fallback → bash
+# marker.
+pack-cli: build bash-bin
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p .zig-cache/e2e
-    BIN_BASH=$(command -v bash)
-    cat > .zig-cache/e2e/pack-cli.zon <<ZON
-    .{ .variants = .{
-        .{ .name = "v2", .binary = "{{ justfile_directory() }}/zig-out/bin/chonk", .match = .{ .{ .bit = .sve2 } } },
-        .{ .name = "v1", .binary = "$BIN_BASH", .match = .{ .{ .bit = .sve } } },
-        .{ .binary = "$BIN_BASH" },
-    } }
-    ZON
-    ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 .zig-cache/e2e/pack-cli.zon \
+    ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 tests/e2e/pack-cli.zon \
         .zig-cache/e2e/pack-cli-fat | grep -q "3 variants (2 unique payload(s))"
     ./zig-out/bin/chonk inspect .zig-cache/e2e/pack-cli-fat \
         | grep -q "machine aarch64, 3 variants"
@@ -81,19 +85,10 @@ consumer:
 # (host hw), qemu max (sve2), neoverse-v1 (sve, no sve2), neoverse-n1
 # (base word only), cortex-a72 (nothing). Each tier has a distinct tracer:
 # bash echoes a marker, chonk prints usage (exit 2).
-tiers:
+tiers: build bash-bin
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p .zig-cache/e2e
-    BIN_BASH=$(command -v bash)
-    cat > .zig-cache/e2e/tiers.zon <<ZON
-    .{ .variants = .{
-        .{ .name = "v2-tier", .binary = "$BIN_BASH", .match = .{ .{ .bit = .sve2 } } },
-        .{ .name = "v1-tier", .binary = "$BIN_BASH", .match = .{ .{ .bit = .sve } } },
-        .{ .binary = "{{ justfile_directory() }}/zig-out/bin/chonk" },
-    } }
-    ZON
-    ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 .zig-cache/e2e/tiers.zon \
+    ./zig-out/bin/chonk pack zig-out/bin/stub-aarch64 tests/e2e/tiers.zon \
         .zig-cache/e2e/fat-tiers > /dev/null
     # Native: whichever tier the host's advertised features select —
     # tolerant because hosts differ (V3/V2 hw → v2 marker; GitHub's N1
@@ -141,137 +136,37 @@ x86-select: consumer
     grep -q "execveat.*errno=8" <<<"$t1"
     echo "ok: x86-select ($s1 vs $s2 — both selection paths; wall errno=8)"
 
-# The make_exe factory (#1): a handoff-shaped consumer with a dependency
-# module, per-variant imports, and exe-level flags — the paths the simple
-# root_source_file shape cannot express. The dispatched tier depends on
-# host hw (sve2 → neoverse_v2; less → the implicit baseline).
+# The make_exe + post_process door: the factory example, built from
+# committed sources. sve2-class hosts match the v2 tier (factory-helper);
+# every other host hits the fallback — the post-processed payload — and
+# prints the fallback binary's marker. A hook silently ignored prints
+# "factory-helper built for generic" instead, and fails both greps.
 factory:
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf .zig-cache/e2e/factory
-    mkdir -p .zig-cache/e2e/factory/src .zig-cache/e2e/factory/lib
-    ln -sfn "{{ justfile_directory() }}" .zig-cache/e2e/factory/lib/chonk
-    cd .zig-cache/e2e/factory
-    cat > build.zig.zon <<ZON
-    .{
-        .name = .factory,
-        .version = "0.0.0",
-        .fingerprint = 0xfb361ef9e71c0392,
-        .minimum_zig_version = "0.16.0",
-        .dependencies = .{
-            .chonk = .{ .path = "lib/chonk" },
-        },
-        .paths = .{ "build.zig", "build.zig.zon", "src" },
-    }
-    ZON
-    # The post-compile hook test payload: a copied host bash. The hook
-    # swaps the baseline variant's compiled binary for it, so a host where
-    # nothing matches dispatches to bash and prints TIER-hook — proving the
-    # PACKED bytes came from the hook's return, not the compile.
-    cp "$(command -v bash)" tracer
-    cat > build.zig <<ZIG
-    const std = @import("std");
-    const Build = std.Build;
-    const chonk = @import("chonk");
-
-    pub fn build(b: *Build) void {
-        const fat = chonk.addExecutable(b, .{
-            .name = "app",
-            .target = .{ .cpu_arch = .aarch64, .abi = .musl },
-            .optimize = .Debug,
-            .install = true,
-            .make_exe = makeExe,
-            .post_process = postProcess,
-            .targets = &.{
-                .{ .model = .{ .explicit = &std.Target.aarch64.cpu.neoverse_v2 } },
-            },
-        });
-        _ = fat;
-    }
-
-    fn postProcess(b: *Build, v: chonk.Variant, payload: Build.LazyPath) Build.LazyPath {
-        // The baseline packs a copied bash (the recipe copies it in as
-        // "tracer" before zig build); other variants pass through. No
-        // backticks in heredoc content: unquoted heredocs run shell
-        // substitution on the content.
-        if (std.mem.eql(u8, v.name, "generic")) return b.path("tracer");
-        return payload;
-    }
-
-    fn makeExe(b: *Build, v: chonk.Variant) *Build.Step.Compile {
-        const helper_mod = b.createModule(.{
-            .root_source_file = b.path("src/helper.zig"),
-            .target = v.target,
-            .optimize = v.optimize,
-        });
-        const app_mod = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = v.target,
-            .optimize = v.optimize,
-        });
-        app_mod.addImport("helper", helper_mod);
-        const exe = b.addExecutable(.{ .name = v.name, .root_module = app_mod });
-        exe.use_llvm = true;
-        return exe;
-    }
-    ZIG
-    cat > src/main.zig <<ZIG
-    const std = @import("std");
-    const helper = @import("helper");
-
-    pub fn main(init: std.process.Init) !void {
-        var buf: [256]u8 = undefined;
-        var stdout: std.Io.File.Writer = .init(.stdout(), init.io, &buf);
-        try stdout.interface.print(
-            "{s} built for {s}\n",
-            .{ helper.tag(), @import("builtin").cpu.model.name },
-        );
-        try stdout.interface.flush();
-    }
-    ZIG
-    cat > src/helper.zig <<ZIG
-    pub fn tag() []const u8 {
-        return "factory-helper";
-    }
-    ZIG
+    cd examples/factory
     zig build --summary all
-    # sve2-class hosts match the v2 tier (factory-helper); N1-class hosts
-    # hit the hooked baseline and print TIER-hook. A hook silently ignored
-    # prints "factory-helper built for generic" — and fails this grep.
-    ./zig-out/bin/app -c 'echo TIER-hook' \
-        | grep -q "factory-helper built for neoverse_v2\|TIER-hook"
-    # The hooked-baseline path, forced: qemu's synthesized auxv has no SVE
-    # under -cpu neoverse-n1, so the baseline — the hook's swapped bash —
-    # dispatches. This is the leg that proves the packed bytes are the
-    # hook's return, on every host, not just no-SVE CI runners.
-    timeout 60 qemu-aarch64 -cpu neoverse-n1 ./zig-out/bin/app -c 'echo TIER-hook' \
-        | grep -q "TIER-hook"
+    ./zig-out/bin/app | grep -q "factory-helper built for neoverse_v2\|fallback build"
+    # The hooked fallback, forced: qemu's synthesized auxv has no SVE
+    # under -cpu neoverse-n1, so the baseline — the hook's swapped
+    # binary — dispatches, on every host.
+    timeout 60 qemu-aarch64 -cpu neoverse-n1 ./zig-out/bin/app \
+        | grep -q "post-processed payload"
     echo "ok: factory (make_exe dependency import + post_process payload swap)"
 
-# CLI door on x86_64: pack a CPUID-conditioned fat (AVX2 tier + fallback)
-# with the x86_64 stub, inspect it, dispatch NATIVELY (the legs this
-# aarch64 box cannot run). Native dispatch skips on non-x86_64 hosts.
-pack-cli-x86:
+# CLI door on x86_64: pack the CPUID-conditioned fixture with the x86_64
+# stub, inspect it, dispatch NATIVELY (the legs this aarch64 box cannot
+# run). The whole leg skips on non-x86_64 hosts — the host bash matches
+# the x86_64 stub only there (consumer-x86 covers pack + inspect on any
+# host).
+pack-cli-x86: build bash-bin
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p .zig-cache/e2e
-    # Both tiers point at the host's bash — one payload byte set, the
-    # dedup shape — but the host bash matches the x86_64 stub only on an
-    # x86_64 host, so the whole leg skips elsewhere (the consumer-x86
-    # recipe covers pack + inspect on any host).
     if [ "$(uname -m)" != "x86_64" ]; then
         echo "skip: pack-cli-x86 needs an x86_64 host (CI x86 runner covers it)"
         exit 0
     fi
-    BIN_BASH=$(command -v bash)
-    cat > .zig-cache/e2e/pack-cli-x86.zon <<ZON
-    .{ .variants = .{
-        .{ .name = "avx2", .binary = "$BIN_BASH",
-           .match = .{ .{ .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } } } },
-        .{ .binary = "$BIN_BASH" },
-    } }
-    ZON
-    ./zig-out/bin/chonk pack zig-out/bin/stub-x86_64 .zig-cache/e2e/pack-cli-x86.zon \
+    ./zig-out/bin/chonk pack zig-out/bin/stub-x86_64 tests/e2e/pack-cli-x86.zon \
         .zig-cache/e2e/pack-cli-x86-fat | grep -q "2 variants (1 unique payload(s))"
     ./zig-out/bin/chonk inspect .zig-cache/e2e/pack-cli-x86-fat \
         | grep -q "machine x86_64, 2 variants"
@@ -302,39 +197,23 @@ consumer-x86:
 # The error paths: a bare stub (bad footer magic), inspect on a non-chonk
 # binary, a config typo (parse error with line:column), and a machine
 # mismatch caught at pack time. All arch-blind.
-errors:
+errors: build bash-bin
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p .zig-cache/e2e
-    BIN_BASH=$(command -v bash)
     case "$(uname -m)" in
-        aarch64) HOST_STUB=stub-aarch64; OTHER_STUB=stub-x86_64 ;;
-        x86_64) HOST_STUB=stub-x86_64; OTHER_STUB=stub-aarch64 ;;
+        aarch64) HOST_STUB=stub-aarch64; MISMATCH=mismatch-aarch64 ;;
+        x86_64) HOST_STUB=stub-x86_64; MISMATCH=mismatch-x86_64 ;;
         *) echo "unsupported host arch" >&2; exit 1 ;;
     esac
     rc=0; out=$(timeout 60 "./zig-out/bin/$HOST_STUB" 2>&1) || rc=$?
     grep -q "bad footer magic" <<<"$out"; test "$rc" -eq 1
-    rc=0; out=$(timeout 60 ./zig-out/bin/chonk inspect "$BIN_BASH" 2>&1) || rc=$?
+    rc=0; out=$(timeout 60 ./zig-out/bin/chonk inspect tests/e2e/bash 2>&1) || rc=$?
     grep -q "not a chonk binary" <<<"$out"; test "$rc" -eq 1
-    cat > .zig-cache/e2e/typo.zon <<ZON
-    .{ .variants = .{
-        .{ .name = "x", .binary = "$BIN_BASH",
-           .match = .{ .{ .bit = .totally_real } } },
-        .{ .binary = "$BIN_BASH" },
-    } }
-    ZON
     rc=0; out=$(timeout 60 ./zig-out/bin/chonk pack "./zig-out/bin/$HOST_STUB" \
-        .zig-cache/e2e/typo.zon .zig-cache/e2e/typo-fat 2>&1) || rc=$?
+        tests/e2e/typo.zon .zig-cache/e2e/typo-fat 2>&1) || rc=$?
     grep -q "unexpected enum literal" <<<"$out"; test "$rc" -eq 1
-    # The OTHER species' stub as the payload → machine mismatch at pack time,
-    # the cheapest portable wrong-species payload (both stubs always built).
-    cat > .zig-cache/e2e/mismatch.zon <<ZON
-    .{ .variants = .{
-        .{ .binary = "{{ justfile_directory() }}/zig-out/bin/$OTHER_STUB" },
-    } }
-    ZON
     rc=0; out=$(timeout 60 ./zig-out/bin/chonk pack "./zig-out/bin/$HOST_STUB" \
-        .zig-cache/e2e/mismatch.zon .zig-cache/e2e/mismatch-fat 2>&1) || rc=$?
+        "tests/e2e/$MISMATCH.zon" .zig-cache/e2e/mismatch-fat 2>&1) || rc=$?
     grep -q "machine mismatch with stub" <<<"$out"; test "$rc" -eq 1
     echo "ok: errors"
 

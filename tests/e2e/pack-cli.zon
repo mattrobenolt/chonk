@@ -1,0 +1,9 @@
+// The CLI-door fixture: three variants, two unique payloads (v1 and the
+// fallback share the copied bash — the dedup shape). Payload paths resolve
+// against this file's directory; "bash" is the host bash copied in by the
+// `bash-bin` recipe (gitignored), because host bash paths differ.
+.{ .variants = .{
+    .{ .name = "v2", .binary = "../../zig-out/bin/chonk", .match = .{ .{ .bit = .sve2 } } },
+    .{ .name = "v1", .binary = "bash", .match = .{ .{ .bit = .sve } } },
+    .{ .binary = "bash" },
+} }

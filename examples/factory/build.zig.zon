@@ -1,0 +1,15 @@
+.{
+    .name = .factory,
+    .version = "0.0.0",
+    .fingerprint = 0xfb361ef9a1e2c285,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The repo this example lives in.
+        .chonk = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

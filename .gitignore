@@ -4,3 +4,4 @@ zig-out/
 .envrc.local
 fat
 chonk-orig.svg
+tests/e2e/bash
