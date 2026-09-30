@@ -45,7 +45,7 @@ aarch64 — examples/consumer carries the full ladder; every tier verified:
 
 | Model | Cloud | Separator (conditions) |
 |---|---|---|
-| neoverse_v3 | AWS Graviton5 | **MIDR part 0xd84** — V3 advertises the same hwcap words as V2 on many hosts (this V3 box: hwcap=0xeff3ffff, hwcap2=0x801bf3bf, no SME advertised), so hwcap CANNOT separate V3 from V2 — the midrPart tiebreak is load-bearing |
+| neoverse_v3 | AWS Graviton5 | Inferred ISA checks plus `extra_match = &.{midrPart(0x41, 0xd84)}`. MIDR alone does not establish ISA support. |
 | neoverse_v2 | AWS Graviton4, GCP Axion | inferred: sve2 family (sve, sve2, crc32, atomics, asimdrdm, asimddp, i8mm, bf16) |
 | neoverse_v1 | AWS Graviton3 | inferred: sve + crypto (aes, sha2, crc32, atomics, asimdrdm, sha3, sm4, asimddp, sve, i8mm, bf16) — qemu's v1 model omits i8mm/bf16, so under qemu it falls to N1 (conservative, correct); real Graviton3 advertises them |
 | neoverse_n1 | AWS Graviton2, Azure Cobalt 100, Ampere Altra (GCP T2A, Oracle) | inferred: base-word crypto (aes, sha2, crc32, atomics, asimdrdm, asimddp) |
@@ -72,7 +72,9 @@ qemu-aarch64 -cpu neoverse-v1 ./dump   # hwcap=0xcffffffb hwcap2=0x13201 midr=0x
 
 # The dispatch matrix — the payload prints its own CPU model (tier identity):
 ./app                                    # native: V3 → neoverse_v3 (midr 0xd84)
-qemu-aarch64 -cpu max ./app              # sve2 family → v3-family tier
+qemu-aarch64 -cpu max ./app              # sve2 family → V2 unless MIDR identifies V3
+qemu-aarch64 -cpu max,midr=0x410fd841 ./app  # V3 with the required ISA features
+qemu-aarch64 -cpu max,sve=off,midr=0x410fd841 ./app  # V3 MIDR without SVE → N1
 qemu-aarch64 -cpu neoverse-v1 ./app      # → n1 (v1 lacks i8mm in qemu; real hw → v1)
 qemu-aarch64 -cpu neoverse-n1 ./app      # → neoverse_n1
 qemu-aarch64 -cpu cortex-a72 ./app      # → generic (fallback)
@@ -86,6 +88,17 @@ kernel → foreign-arch ENOEXEC (errno 8). Emulation boundary, not a chonk
 defect — everything up to execveat verifies under -strace, and the same code
 path runs natively on aarch64. Full x86 dispatch needs real x86_64 hardware
 or `boot.binfmt.emulatedSystems = [ "x86_64-linux" ]` (Matt's system config).
+
+## OS state and explicit matches
+
+Format version 2 adds `Source.xcr0 = 4`. The stub checks XSAVE and OSXSAVE
+before XGETBV. Inferred AVX variants require XCR0 mask `0x6`. AVX-512
+variants require mask `0xe6`. `src/x86.zig` defines the masks and tests
+incomplete state with synthetic probes.
+
+A nonempty `TargetSpec.match` replaces inference. It must include every
+required ISA condition. `extra_match` supplements inference or the explicit
+match. Use `extra_match` for a MIDR tiebreak.
 
 ## Bugs this rig has caught (do not repeat)
 

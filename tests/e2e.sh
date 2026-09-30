@@ -128,6 +128,10 @@ popd >/dev/null
 if [ "$arch" = aarch64 ]; then
     run ./examples/consumer/zig-out/bin/app
     expect_out "app built for CPU model: neoverse" "consumer native dispatch (tolerant: host tier)"
+
+    run qemu-aarch64 -cpu max,sve=off,midr=0x410fd841 ./examples/consumer/zig-out/bin/app
+    expect_out "app built for CPU model: neoverse_n1" "consumer V3 MIDR without SVE falls to N1"
+    expect_rc 0 "consumer V3 MIDR without SVE rc"
 else
     skip "consumer native dispatch (aarch64 fat needs an aarch64 host)"
 fi
@@ -192,6 +196,15 @@ if [ -n "$s1" ] && [ -n "$s2" ] && [ "$s1" != "$s2" ]; then
     ok "x86-select ($s1 vs $s2 — both selection paths)"
 else
     fail "x86-select (sendfile sizes: '$s1' vs '$s2')"
+fi
+# Haswell retains AVX and AVX2 but lacks XSAVE and OSXSAVE.
+t_no_xsave=$(trace -cpu Haswell,-xsave,-hle,-rtm)
+s_no_xsave=$(grep -m1 "sendfile" <<<"$t_no_xsave" | sed 's/.*= //')
+if [ -n "$s2" ] && [ "$s_no_xsave" = "$s2" ]; then
+    ok "x86-select without XSAVE/OSXSAVE (fallback)"
+else
+    out=$t_no_xsave
+    fail "x86-select without XSAVE/OSXSAVE ('$s_no_xsave' vs fallback '$s2')"
 fi
 if [ "$arch" != x86_64 ]; then
     if grep -q "execveat.*errno=8" <<<"$t1"; then

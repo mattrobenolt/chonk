@@ -11,7 +11,7 @@ const testing = std.testing;
 /// Footer magic: `"CHONKv01"` little-endian.
 pub const magic: u64 = 0x3130_764b_4e4f_4843;
 
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 /// Payload alignment within the fat file: absolute file offset must be a
 /// multiple of this. Absolute (not relative) so mmap-based dispatch stays
@@ -40,6 +40,9 @@ pub const Source = enum(u8) {
     /// x86_64 `CPUID` — unprivileged, read directly by the stub. Transport
     /// encoding in the enum doc above.
     cpuid = 3,
+    /// x86_64 `XCR0`: `(value & mask) == expected`.
+    /// Without XSAVE or OSXSAVE, the condition fails without an XGETBV instruction.
+    xcr0 = 4,
 };
 
 /// Fixed footer, always the last `@sizeOf(Footer)` bytes of the file.
@@ -203,8 +206,7 @@ test "footer encode pins little-endian byte layout" {
     try testing.expectEqualSlices(u8, &[_]u8{
         'C',  'H',  'O',  'N',  'K',  'v',  '0',  '1',
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-        0x0c, 0x0b, 0x0a, 0x09,
-        0x10, 0x0f, 0x0e, 0x0d,
+        0x0c, 0x0b, 0x0a, 0x09, 0x10, 0x0f, 0x0e, 0x0d,
         0x15, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     }, &bytes);
 }
@@ -241,6 +243,17 @@ test "condition round-trip" {
     };
     const bytes = encode(Condition, cond);
     try testing.expectEqual(cond, try decode(Condition, &bytes));
+}
+
+test "XCR0 condition pins source 4 and the unchanged record layout" {
+    const condition: Condition = .{ .source = .xcr0, .mask = 0xe6, .expected = 0xe6 };
+    const bytes = encode(Condition, condition);
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xe6, 0, 0, 0, 0, 0, 0, 0,
+        0xe6, 0, 0, 0, 0, 0, 0, 0,
+        4,    0, 0, 0, 0, 0, 0, 0,
+    }, &bytes);
+    try testing.expectEqual(condition, try decode(Condition, &bytes));
 }
 
 test "decode rejects unknown source" {
@@ -281,6 +294,14 @@ test "findFooter rejects short file, bad magic, bad version" {
     try testing.expectError(error.Truncated, findFooter(&([_]u8{0} ** 23)));
     const no_magic: [@sizeOf(Footer)]u8 = @splat(0);
     try testing.expectError(error.BadMagic, findFooter(&no_magic));
+    const old_version = encode(Footer, .{
+        .magic = magic,
+        .table_offset = 0,
+        .variant_count = 0,
+        .format_version = 1,
+        .machine = 0xb7,
+    });
+    try testing.expectError(error.UnsupportedVersion, findFooter(&old_version));
     const wrong_version = encode(Footer, .{
         .magic = magic,
         .table_offset = 0,

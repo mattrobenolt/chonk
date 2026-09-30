@@ -26,8 +26,6 @@ At startup, the stub does this:
 
 1. Walk the initial stack: argc, argv, envp, auxv.
 2. Read `AT_EXECFN` (its own path), `AT_HWCAP`, and `AT_HWCAP2`.
-   On x86_64, conditions read CPUID directly; the instruction is
-   unprivileged, so the kernel stays out of the detection path.
 3. Open its own file and read the footer from EOF.
 4. Walk the variant table in order. The first variant whose conditions all
    pass wins. The variant with no match is the fallback.
@@ -37,8 +35,12 @@ At startup, the stub does this:
 The release stub fits in the first three pages of the file. It issues raw
 syscalls only: `openat`, `lseek`, `pread64`, `memfd_create`, `sendfile`,
 and `execveat`. On aarch64 the detection values come from the auxv; on
-x86_64 the stub reads CPUID itself. Both arms of the entry are copied
+x86_64 the stub reads CPUID and XCR0 itself. Both arms of the entry are copied
 verbatim from Zig's own startup code, per architecture.
+
+Inferred AVX variants require XCR0 bits 1 and 2. AVX-512 variants also
+require bits 5, 6, and 7. The stub checks XSAVE and OSXSAVE before it
+executes XGETBV. If either flag is absent, the XCR0 condition fails.
 
 One fat binary serves one architecture. The footer stores the ELF
 `e_machine` value, and the stub validates this value before it trusts the
@@ -73,6 +75,20 @@ const fat = chonk.addExecutable(b, .{
 lists the CPU models. These are the only things that vary per variant. A
 target entry can also carry an explicit `match` to override the condition
 inference, for silicon chonk has not heard of.
+
+A nonempty `match` replaces inference. It must include every required ISA
+condition. `extra_match` adds conditions without removal of the inferred
+checks, or supplements an explicit `match`.
+
+```zig
+.{
+    .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v3 },
+    .extra_match = &.{chonk.midrPart(0x41, 0xd84)},
+},
+```
+
+MIDR identifies the CPU model, not the ISA features that the kernel exposes.
+The V3 entry retains the inferred ISA checks alongside its MIDR tiebreak.
 
 For builds with dependencies or compile options, set `make_exe` instead
 of `root_source_file`. chonk calls it once per variant with the
@@ -167,7 +183,7 @@ One call per architecture covers the ARM fleets on AWS, GCP, and Azure:
 
 | Model | Cloud | Separated by |
 |---|---|---|
-| `neoverse_v3` | AWS Graviton5 | `midrPart(0x41, 0xd84)` — the MIDR tiebreak; V3 advertises the same hwcap words as V2 |
+| `neoverse_v3` | AWS Graviton5 | Inferred ISA checks plus `extra_match = &.{midrPart(0x41, 0xd84)}` |
 | `neoverse_v2` | AWS Graviton4, GCP Axion | inferred: the SVE2 family |
 | `neoverse_v1` | AWS Graviton3 | inferred: SVE + crypto |
 | `neoverse_n1` | AWS Graviton2, Azure Cobalt 100, Ampere Altra | inferred: base-word crypto (AES, SHA2, CRC32, LSE, ...) |
@@ -204,6 +220,9 @@ number.
     //   .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 }
     // CPUID form (x86_64):
     //   .{ .cpuid = .{ .leaf = 7, .register = .ebx, .bit = 5 } }
+    // AVX state condition, alongside the required CPUID features:
+    //   .{ .source = .xcr0, .mask = 0x6, .expected = 0x6 }
+    // AVX-512 state uses mask = expected = 0xe6.
     .{ .binary = "build/app-generic" }, // the fallback: no match
 } }
 ```
@@ -219,11 +238,17 @@ source of truth for the packer and the stub.
 | `VariantEntry`| 32 B  | `payload_offset` u64, `payload_size` u64, `condition_offset` u32, `condition_count` u32, `is_default` u8, pad |
 | `Condition`   | 24 B  | `mask` u64, `expected` u64, `source` u8, pad                          |
 
-Condition sources: `hwcap` and `hwcap2` compare an auxv word against
-`mask`. `cpuid` transports a leaf, a subleaf, a register, and a bit.
-`midr` compares `MIDR_EL1` against `mask` — the part-number tiebreak for
-same-hwcap silicon (`pack.midrPart(implementer, part)` builds the common
-form).
+Condition sources:
+
+- `hwcap` and `hwcap2` compare an auxv word against `mask`.
+- `cpuid` transports a leaf, a subleaf, a register, and a bit.
+- `midr` compares `MIDR_EL1` against `mask` for the CPU tiebreak.
+- `xcr0` compares XCR0 against `mask` after the XSAVE and OSXSAVE checks.
+
+Format version 2 adds `xcr0` as source 4. Record sizes and the magic remain
+unchanged. Version 1 stubs reject version 2 trailers. The new stub also
+rejects version 1 trailers. The build API compiles its matching stub
+from source. The CLI requires the current stub for new packs.
 
 Identical payload bytes are stored once — entries may share
 `payload_offset`. The packer never holds payloads resident: sizes come

@@ -7,8 +7,12 @@ const Target = std.Target;
 const aarch64 = Target.aarch64;
 const x86 = Target.x86;
 const OptimizeMode = std.builtin.OptimizeMode;
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+const resolveTargetQuery = std.zig.system.resolveTargetQuery;
 
 const pack = @import("pack.zig");
+const x86_probe = @import("x86.zig");
 /// The vocabulary shared with the ZON config — pack.zig is the one
 /// definition; re-exported for consumer ergonomics.
 pub const Match = pack.Match;
@@ -28,8 +32,8 @@ const stdio = @import("stdio.zig");
 /// explicit-only (the ZON config's raw form).
 /// Infer the dispatch conditions from a target: every inferable condition
 /// whose feature the target has and the arch baseline lacks. aarch64
-/// yields named hwcap bits; x86_64 yields CPUID feature tests.
-fn inferMatches(b: *Build, target: Target) []const pack.Match {
+/// yields named hwcap bits. x86_64 yields CPUID features and the required XCR0 state.
+fn inferMatches(arena: Allocator, target: Target) []const pack.Match {
     const cpu = target.cpu;
     const baseline = Target.Cpu.baseline(cpu.arch, target.os);
     var matches: std.ArrayList(pack.Match) = .empty;
@@ -41,7 +45,7 @@ fn inferMatches(b: *Build, target: Target) []const pack.Match {
             inline for (pack.aarch64_table) |e| {
                 if (e.feature) |feature| {
                     if (cpu.has(.aarch64, feature) and !baseline.has(.aarch64, feature)) {
-                        matches.append(b.allocator, .{ .bit = e.bit }) catch @panic("OOM");
+                        matches.append(arena, .{ .bit = e.bit }) catch @panic("OOM");
                     }
                 }
             }
@@ -49,13 +53,26 @@ fn inferMatches(b: *Build, target: Target) []const pack.Match {
         .x86_64 => {
             inline for (pack.x86_table) |e| {
                 if (cpu.has(.x86, e.feature) and !baseline.has(.x86, e.feature)) {
-                    matches.append(b.allocator, .{ .cpuid = e.cpuid }) catch @panic("OOM");
+                    matches.append(arena, .{ .cpuid = e.cpuid }) catch @panic("OOM");
                 }
+            }
+            const state_mask: u64 = if (cpu.has(.x86, .avx512f))
+                x86_probe.avx512_state
+            else if (cpu.has(.x86, .avx))
+                x86_probe.avx_state
+            else
+                0;
+            if (state_mask != 0) {
+                matches.append(arena, .{
+                    .source = .xcr0,
+                    .mask = state_mask,
+                    .expected = state_mask,
+                }) catch @panic("OOM");
             }
         },
         else => @panic("chonk.addExecutable: unsupported arch (aarch64, x86_64)"),
     }
-    return matches.toOwnedSlice(b.allocator) catch @panic("OOM");
+    return matches.toOwnedSlice(arena) catch @panic("OOM");
 }
 
 /// The fallback target: identical to the arch baseline. `.{ .target = .{} }`
@@ -111,15 +128,24 @@ fn modelArch(model: *const Target.Cpu.Model) ?Target.Cpu.Arch {
     return null;
 }
 
-/// One entry in `targets` (#2): the CPU model that varies, plus an
-/// optional explicit condition override. With `match` empty, chonk infers
-/// the conditions from the model's feature delta over the arch baseline;
-/// an override covers silicon chonk has not heard of — the same escape
-/// hatch the ZON config's raw form provides in the CLI.
+/// One CPU model and its dispatch conditions.
 pub const TargetSpec = struct {
     model: Target.Query.CpuModel,
+    /// A nonempty match replaces inference. It must include every required ISA condition.
     match: []const pack.Match = &.{},
+    /// These conditions supplement inference or the explicit match.
+    /// Use this field for a MIDR tiebreak without removal of the ISA checks.
+    extra_match: []const pack.Match = &.{},
 };
+
+fn targetMatches(arena: Allocator, target: Target, spec: TargetSpec) []const pack.Match {
+    var matches: std.ArrayList(pack.Match) = .empty;
+    const required = if (spec.match.len > 0) spec.match else inferMatches(arena, target);
+    // Runtime match expressions can refer to stack temporaries. The graph owns the copies.
+    matches.appendSlice(arena, required) catch @panic("OOM");
+    matches.appendSlice(arena, spec.extra_match) catch @panic("OOM");
+    return matches.toOwnedSlice(arena) catch @panic("OOM");
+}
 
 /// What chonk hands the consumer's executable factory (#1): everything a
 /// variant's build needs — its auto-derived name, its per-variant resolved
@@ -240,18 +266,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         var query = options.target;
         query.cpu_model = model;
         const resolved = b.resolveTargetQuery(query);
-        // An explicit match overrides inference (#2): it covers silicon
-        // chonk has not heard of, and the unmappable bits (pmull, sha1,
-        // ...) that inference can never express.
-        // Dupe the caller's match slice into the graph arena: a runtime
-        // call like midrPart(...) inside `&.{ ... }` creates a stack
-        // temporary whose slice dangles by make() time — the bit-literal
-        // case only worked because comptime-known literals land in rodata.
-        // Inference output is already arena-owned.
-        const match = if (spec.match.len > 0)
-            b.allocator.dupe(pack.Match, spec.match) catch @panic("OOM")
-        else
-            inferMatches(b, resolved.result);
+        const match = targetMatches(b.allocator, resolved.result, spec);
         const fallback = isBaseline(resolved.result);
         if (fallback) {
             fallback_count += 1;
@@ -281,7 +296,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         targets[used] = .{
             .name = resolved.result.cpu.model.name,
             .resolved = resolved,
-            .match = inferMatches(b, resolved.result),
+            .match = inferMatches(b.allocator, resolved.result),
             .fallback = true,
         };
         used += 1;
@@ -506,4 +521,83 @@ const PackStep = struct {
     }
 };
 
+test "extra_match retains inferred ISA checks and owns caller conditions" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const target = try resolveTargetQuery(testing.io, .{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .cpu_model = .{ .explicit = &aarch64.cpu.neoverse_v3 },
+    });
+    const inferred = inferMatches(arena, target);
+    var extra = [_]pack.Match{midrPart(0x41, 0xd84)};
+    const matches = targetMatches(arena, target, .{
+        .model = .{ .explicit = &aarch64.cpu.neoverse_v3 },
+        .extra_match = &extra,
+    });
+    try testing.expectEqual(inferred.len + 1, matches.len);
+    try testing.expectEqualSlices(pack.Match, inferred, matches[0..inferred.len]);
+    var found_sve = false;
+    var found_sve2 = false;
+    for (matches) |m| {
+        if (m.bit == .sve) found_sve = true;
+        if (m.bit == .sve2) found_sve2 = true;
+    }
+    try testing.expect(found_sve);
+    try testing.expect(found_sve2);
+    extra[0] = midrPart(0x41, 0xd0c);
+    try testing.expectEqual(midrPart(0x41, 0xd84), matches[inferred.len]);
+}
 
+test "explicit match still overrides inference and accepts extra conditions" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const target = try resolveTargetQuery(testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux });
+    var explicit = [_]pack.Match{.{ .bit = .sve }};
+    const matches = targetMatches(arena, target, .{
+        .model = .baseline,
+        .match = &explicit,
+        .extra_match = &.{midrPart(0x41, 0xd84)},
+    });
+    try testing.expectEqual(@as(u32, 2), matches.len);
+    explicit[0] = .{ .bit = .sve2 };
+    try testing.expectEqual(pack.Match{ .bit = .sve }, matches[0]);
+    try testing.expectEqual(midrPart(0x41, 0xd84), matches[1]);
+}
+
+test "x86 inference requires the OS state for each psABI vector tier" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tiers = .{
+        .{ &x86.cpu.x86_64, @as(u64, 0) },
+        .{ &x86.cpu.x86_64_v2, @as(u64, 0) },
+        .{ &x86.cpu.x86_64_v3, @as(u64, 0x6) },
+        .{ &x86.cpu.x86_64_v4, @as(u64, 0xe6) },
+    };
+    inline for (tiers) |tier| {
+        const target = try resolveTargetQuery(testing.io, .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .cpu_model = .{ .explicit = tier[0] },
+        });
+        const matches = inferMatches(arena, target);
+        var state_count: u32 = 0;
+        var xsave_count: u32 = 0;
+        for (matches) |m| {
+            if (m.source == .xcr0) {
+                state_count += 1;
+                try testing.expectEqual(tier[1], m.mask.?);
+                try testing.expectEqual(tier[1], m.expected.?);
+            }
+            if (m.cpuid) |c| {
+                if (c.leaf == 1 and c.register == .ecx and c.bit == 26) xsave_count += 1;
+            }
+        }
+        const expected_count: u32 = if (tier[1] == 0) 0 else 1;
+        try testing.expectEqual(expected_count, state_count);
+        try testing.expectEqual(expected_count, xsave_count);
+    }
+}

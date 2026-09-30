@@ -7,7 +7,7 @@
 //! Dispatch semantics: first variant in table order whose conditions all
 //! pass wins (an is_default entry, or one with no conditions, matches
 //! unconditionally); conditions AND — aarch64 against AT_HWCAP/AT_HWCAP2,
-//! x86_64 against CPUID (unprivileged, read directly).
+//! x86_64 against CPUID and the OS state in XCR0.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -15,6 +15,7 @@ const elf = std.elf;
 const builtin = @import("builtin");
 
 const format = @import("format.zig");
+const x86 = @import("x86.zig");
 
 /// This stub's species — selected at comptime by the build target.
 const my_machine: u16 = switch (builtin.cpu.arch) {
@@ -59,9 +60,6 @@ export fn _start() callconv(.naked) noreturn {
     }
 }
 
-/// Read CPUID — x86_64 only. One instruction, no privileges needed; the
-/// kernel is not involved, which is the whole difference from aarch64's
-/// auxv-mediated detection.
 /// Read MIDR_EL1 — aarch64 only. The kernel traps and emulates this read
 /// at EL0, but only when HWCAP_CPUID (AT_HWCAP bit 11) is advertised;
 /// callers must gate on it or the read faults.
@@ -69,22 +67,6 @@ fn readMidr() u64 {
     return asm volatile ("mrs x0, midr_el1"
         : [out] "={x0}" (-> u64),
     );
-}
-
-fn readCpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
-    var eax: u32 = undefined;
-    var ebx: u32 = undefined;
-    var ecx: u32 = undefined;
-    var edx: u32 = undefined;
-    asm volatile ("cpuid"
-        : [eax] "={eax}" (eax),
-          [ebx] "={ebx}" (ebx),
-          [ecx] "={ecx}" (ecx),
-          [edx] "={edx}" (edx),
-        : [leaf] "{eax}" (leaf),
-          [subleaf] "{ecx}" (subleaf),
-    );
-    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
 /// Walk the initial stack (x0 = the original sp), then dispatch.
@@ -217,7 +199,7 @@ fn matches(
                     const subleaf: u32 = @truncate(condition.mask);
                     const reg: u8 = @truncate(condition.expected >> 5);
                     const bit: u5 = @truncate(condition.expected);
-                    const r = readCpuid(leaf, subleaf);
+                    const r = x86.Native.readCpuid(leaf, subleaf);
                     const word: u32 = switch (reg) {
                         0 => r.eax,
                         1 => r.ebx,
@@ -228,6 +210,12 @@ fn matches(
                     break :blk (word >> bit) & 1 == 1;
                 }
                 fatal("cpuid condition on a non-x86_64 stub");
+            },
+            .xcr0 => blk: {
+                if (builtin.cpu.arch == .x86_64) {
+                    break :blk x86.matchesXcr0(x86.Native, condition.mask, condition.expected);
+                }
+                fatal("xcr0 condition on a non-x86_64 stub");
             },
             .midr => blk: {
                 // Comptime-gated: the aarch64 asm is never analyzed on
