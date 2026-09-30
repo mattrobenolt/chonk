@@ -56,7 +56,7 @@ pub fn build(b: *Build) void {
             // (Graviton1 / Cortex-A72) is appended automatically.
             .{
                 .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v3 },
-                .match = &.{chonk.midrPart(0x41, 0xd84)},
+                .extra_match = &.{chonk.midrPart(0x41, 0xd84)},
             },
             .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v2 } },
             .{ .model = .{ .explicit = &Target.aarch64.cpu.neoverse_v1 } },

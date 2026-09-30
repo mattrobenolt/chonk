@@ -103,6 +103,7 @@ pub const x86_table = [_]X86Entry{
     .{ .feature = .movbe, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 22 } },
     .{ .feature = .popcnt, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 23 } },
     .{ .feature = .aes, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 25 } },
+    .{ .feature = .xsave, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 26 } },
     .{ .feature = .avx, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 28 } },
     .{ .feature = .f16c, .cpuid = .{ .leaf = 1, .register = .ecx, .bit = 29 } },
     // CPUID.7H.0H:EBX
@@ -915,6 +916,23 @@ test "compileMatches: bit name implies source and expected" {
     try testing.expectEqual(@as(u64, 1 << 1), conditions[0].mask);
     try testing.expectEqual(@as(u64, 1 << 1), conditions[0].expected);
     try testing.expectEqual(format.Source.hwcap2, conditions[0].source);
+}
+
+test "compileMatches: XCR0 retains its mask and expected state" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conditions = try compileMatches(arena, .{
+        .name = "v4",
+        .binary = "bin/app-v4",
+        .match = &.{.{ .source = .xcr0, .mask = 0xe6, .expected = 0xe6 }},
+    });
+    try testing.expectEqual(@as(u32, 1), conditions.len);
+    try testing.expectEqual(format.Condition{
+        .source = .xcr0,
+        .mask = 0xe6,
+        .expected = 0xe6,
+    }, conditions[0]);
 }
 
 test "ZON rejects unknown bits at parse time" {

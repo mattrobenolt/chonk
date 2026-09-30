@@ -147,6 +147,13 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
                 .{ leaf, subleaf, reg_name, bit },
             ) catch "oom";
         },
+        .xcr0 => {
+            return std.fmt.allocPrint(
+                arena,
+                "(xcr0 & 0x{x}) == 0x{x} (requires XSAVE/OSXSAVE)",
+                .{ condition.mask, condition.expected },
+            ) catch "oom";
+        },
         .midr => {
             // Recognize the midrPart form (the common tiebreak): decode
             // implementer + part. Anything else prints raw.
@@ -192,6 +199,11 @@ test "describeCondition names known values, raw otherwise" {
             .expected = (@as(u64, @intFromEnum(pack.Cpuid.Register.ebx)) << 5) | 5,
             .source = .cpuid,
         }),
+    );
+
+    try testing.expectEqualStrings(
+        "(xcr0 & 0xe6) == 0xe6 (requires XSAVE/OSXSAVE)",
+        describeCondition(arena, .{ .mask = 0xe6, .expected = 0xe6, .source = .xcr0 }),
     );
 
     // Unknown hwcap mask: raw comparison.

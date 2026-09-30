@@ -348,3 +348,19 @@ in order of preference:
   streaming into the memfd becomes worth the complexity.
 - Whether we ever want more than AND-of-conditions-per-variant match logic —
   resist adding this until something actually needs it.
+
+## Dispatch safety corrections (2026-09-29)
+
+A nonempty `TargetSpec.match` replaces inference. It must include every
+required ISA condition. `extra_match` adds conditions to inference or an
+explicit match. The V3 example uses `extra_match` for its MIDR tiebreak.
+MIDR identifies the model, not the features that the kernel exposes.
+
+Format version 2 adds `Source.xcr0 = 4`. The record sizes and magic remain
+unchanged. The condition compares `(XCR0 & mask) == expected`. The stub
+requires CPUID.1:ECX bits 26 and 27 before any XGETBV instruction.
+If XSAVE or OSXSAVE is absent, the condition fails.
+
+Inferred AVX targets require XCR0 bits 1 and 2 (`0x6`). Inferred AVX-512
+targets also require bits 5, 6, and 7 (`0xe6`). Both format versions reject
+the other version. The CLI requires the current stub for new packs.

@@ -55,4 +55,5 @@ fn usageExit() u8 {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("inspect.zig");
+    _ = @import("build.zig");
 }

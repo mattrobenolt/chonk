@@ -119,6 +119,15 @@ Full inventory and recipes: [references/linux-raw-layer.md](references/linux-raw
 
 `indexOf` → `find`, `indexOfScalar` → `findScalar`, `lastIndexOf` → `findLast`, `indexOfPos` → `findPosLinear` family. New cut helpers: `cut`, `cutPrefix`, `cutSuffix`, `cutScalar`, `cutLast`, `cutLastScalar`. Emitting `std.mem.indexOf*` is a compile error now.
 
+### Inline assembly and target queries
+
+Zig inline assembly outputs require local identifiers, not struct field expressions.
+`(result.eax)` fails at parse time. Use `(eax)` and construct the result after
+the assembly block.
+
+`std.zig.system.resolveTargetQuery` takes `(io, query)` in 0.16.
+Tests use `std.testing.io` as the first argument.
+
 ### 7. Other 0.16 breaks, one line each
 
 - `@Type` removed → `@Int(.unsigned, 10)`, `@Struct`, `@Union`, `@Enum`, `@Pointer`, `@Fn`, `@Tuple`, `@EnumLiteral()`.
