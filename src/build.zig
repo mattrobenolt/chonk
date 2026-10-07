@@ -12,13 +12,13 @@ const testing = std.testing;
 const resolveTargetQuery = std.zig.system.resolveTargetQuery;
 
 const pack = @import("pack.zig");
-const x86_probe = @import("x86.zig");
 /// The vocabulary shared with the ZON config — pack.zig is the one
 /// definition; re-exported for consumer ergonomics.
 pub const Match = pack.Match;
 pub const midrPart = pack.midrPart;
 pub const Bit = pack.Bit;
 const stdio = @import("stdio.zig");
+const x86_probe = @import("x86.zig");
 
 // ---------------------------------------------------------------------------
 // Build-system integration — usable from any project that depends on chonk.
@@ -467,6 +467,8 @@ const PackStep = struct {
 
     fn make(step: *Step, options: Step.MakeOptions) anyerror!void {
         _ = options;
+
+        defer stdio.flush();
         const b = step.owner;
         const io = b.graph.io;
         const arena = b.allocator;
@@ -500,10 +502,6 @@ const PackStep = struct {
             return step.fail("create cache dir: {s}", .{@errorName(err)});
         };
 
-        // The same module the CLI uses; stdio is ours to init in-process,
-        // and ours to flush on every exit path of make().
-        stdio.init(io);
-        defer stdio.flush();
         const stub_path = self.stub.getPath2(b, step);
         const cwd = Io.Dir.cwd();
         const variants = try arena.alloc(pack.Variant, self.inputs.len);

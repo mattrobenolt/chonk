@@ -26,6 +26,8 @@ const Wyhash = std.hash.Wyhash;
 
 const format = @import("format.zig");
 const stdio = @import("stdio.zig");
+const stderr = stdio.err;
+const stdout = stdio.out;
 
 /// Not a format rule — a refusal to concatenate something absurd.
 const max_file_size: u64 = 1 << 30;
@@ -273,7 +275,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     const cwd = Io.Dir.cwd();
 
     if (args.len != 3) {
-        stdio.writeAll(.err, "usage: chonk pack <stub> <config.zon> <output>");
+        stderr.writeAll("usage: chonk pack <stub> <config.zon> <output>");
         return error.Usage;
     }
 
@@ -286,7 +288,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
         .free_on_error = false,
     }) catch |err| {
         if (err == error.ParseZon) {
-            stdio.print(.err, "chonk: {s}: {f}", .{ args[1], &diag });
+            stderr.print("chonk: {s}: {f}\n", .{ args[1], &diag });
         }
         return error.Config;
     };
@@ -322,7 +324,7 @@ pub fn packAll(
 
     var unique_count: usize = 0;
     for (loaded) |v| unique_count = @max(unique_count, v.payload_index + 1);
-    stdio.print(.out, "packed: {d} variants ({d} unique payload(s)), total {d}", .{
+    stdout.print("packed: {d} variants ({d} unique payload(s)), total {d}\n", .{
         loaded.len, unique_count, lay.size,
     });
     for (loaded, 0..) |v, i| {
@@ -332,9 +334,8 @@ pub fn packAll(
             if (prev.payload_index == v.payload_index) shared = true;
         }
         const suffix: []const u8 = if (v.cfg.match.len == 0) ", fallback" else "";
-        stdio.print(
-            .out,
-            "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s}{s})",
+        stdout.print(
+            "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s}{s})\n",
             .{
                 v.cfg.name,
                 offset,
@@ -592,7 +593,7 @@ fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
 /// Report a config problem and hand back the config error — mapped to
 /// exit 1 by the front door.
 fn configFail(comptime fmt: []const u8, args: anytype) error{Config} {
-    stdio.print(.err, "chonk: " ++ fmt, args);
+    stderr.print("chonk: " ++ fmt ++ "\n", args);
     return error.Config;
 }
 
@@ -669,7 +670,7 @@ fn streamPayload(io: Io, config_dir: Io.Dir, w: *Io.Writer, ref: PayloadRef) !vo
 }
 
 fn logFail(path: []const u8, action: []const u8, err: anyerror) void {
-    stdio.print(.err, "packer: {s} {s}: {s}", .{ action, path, @errorName(err) });
+    stderr.print("packer: {s} {s}: {s}\n", .{ action, path, @errorName(err) });
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +863,6 @@ test "config parses from ZON" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    stdio.init(testing.io);
 
     const source =
         \\.{ .variants = .{
@@ -881,7 +881,7 @@ test "config parses from ZON" {
     const config = zon.parse.fromSliceAlloc(Config, arena, buf, &diag, .{
         .free_on_error = false,
     }) catch |err| {
-        stdio.print(.err, "parse failed: {f}", .{&diag});
+        stderr.print("parse failed: {f}\n", .{&diag});
         return err;
     };
 
@@ -904,7 +904,6 @@ test "compileMatches: bit name implies source and expected" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    stdio.init(testing.io);
 
     const v: NamedVariant = .{
         .name = "v2",
@@ -939,7 +938,6 @@ test "ZON rejects unknown bits at parse time" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    stdio.init(testing.io);
 
     // A bad bit name is a type error now — line:column from the parser,
     // not a runtime configFail.
@@ -965,7 +963,6 @@ test "compileMatches: rejects mixed and incomplete forms" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    stdio.init(testing.io);
 
     // Bit form with raw fields set.
     try testing.expectError(error.Config, compileMatches(arena, .{
@@ -997,7 +994,6 @@ test "compileMatches: rejects mixed and incomplete forms" {
 }
 
 test "elfCheck: machine + program-ness" {
-    stdio.init(testing.io);
     const e_type_off = @offsetOf(elf.Elf64_Ehdr, "e_type");
     const e_machine_off = @offsetOf(elf.Elf64_Ehdr, "e_machine");
     const e_entry_off = @offsetOf(elf.Elf64_Ehdr, "e_entry");
@@ -1026,7 +1022,6 @@ test "elfCheck: machine + program-ness" {
 
 test "writeFat: dedups identical payload bytes" {
     const io = testing.io;
-    stdio.init(io);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1120,7 +1115,6 @@ test "writeFat: dedups identical payload bytes" {
 
 test "writeFat: two-variant round-trip through a real file" {
     const io = testing.io;
-    stdio.init(io);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

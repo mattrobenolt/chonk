@@ -42,6 +42,7 @@
               just
               pinact
               zizmor
+              shellcheck
             ];
           };
         };

@@ -9,6 +9,7 @@ const stringToEnum = std.meta.stringToEnum;
 const inspect = @import("inspect.zig");
 const pack = @import("pack.zig");
 const stdio = @import("stdio.zig");
+const stderr = stdio.err;
 
 const Cmd = enum {
     pack,
@@ -19,7 +20,6 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
 
-    stdio.init(io);
     defer stdio.flush();
 
     const args = try init.minimal.args.toSlice(arena);
@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !u8 {
     const rest = args[2..];
 
     switch (stringToEnum(Cmd, cmd) orelse {
-        stdio.print(.err, "chonk: unknown command '{s}'", .{cmd});
+        stderr.print("chonk: unknown command '{s}'\n", .{cmd});
         return usageExit();
     }) {
         .pack => {
@@ -43,12 +43,12 @@ pub fn main(init: std.process.Init) !u8 {
 
 /// Print top-level usage and return exit code 2.
 fn usageExit() u8 {
-    const usage =
+    stderr.writeAll(
         \\ usage: chonk <command> [args]
         \\   chonk pack <stub> <config.zon> <output>  pack a fat binary from a config
         \\   chonk inspect <binary>                   print a fat binary's variant table
-    ;
-    stdio.writeAll(.err, usage ++ "\n");
+        \\
+    );
     return 2;
 }
 

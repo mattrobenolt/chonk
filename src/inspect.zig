@@ -14,23 +14,24 @@ const Allocator = mem.Allocator;
 const format = @import("format.zig");
 const pack = @import("pack.zig");
 const stdio = @import("stdio.zig");
+const stderr = stdio.err;
+const stdout = stdio.out;
 
 /// `chonk inspect <binary>`. args = everything after the subcommand word.
 pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     if (args.len != 1) {
-        stdio.writeAll(.err, "usage: chonk inspect <binary>");
+        stderr.writeAll("usage: chonk inspect <binary>");
         return error.Usage;
     }
 
     const fat = try pack.readFile(io, arena, Io.Dir.cwd(), args[0]);
     const footer = format.findFooter(fat) catch |err| {
-        stdio.print(.err, "chonk: {s}: not a chonk binary ({s})", .{ args[0], @errorName(err) });
+        stderr.print("chonk: {s}: not a chonk binary ({s})\n", .{ args[0], @errorName(err) });
         return 1;
     };
 
-    stdio.print(.out, "{s}: chonk fat binary", .{args[0]});
-    stdio.print(
-        .out,
+    stdout.print("{s}: chonk fat binary\n", .{args[0]});
+    stdout.print(
         "  format version {d}, machine {s}, {d} variants, total {d} bytes",
         .{ footer.format_version, machineName(footer.machine), footer.variant_count, fat.len },
     );
@@ -39,7 +40,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     // footer. Widen before arithmetic — the trailer is untrusted.
     const count = @as(u64, footer.variant_count) * @sizeOf(format.VariantEntry);
     if (footer.table_offset + count > fat.len - @as(u64, @sizeOf(format.Footer))) {
-        stdio.print(.err, "chonk: {s}: entry table out of range", .{args[0]});
+        stderr.print("chonk: {s}: entry table out of range\n", .{args[0]});
         return 1;
     }
 
@@ -60,9 +61,8 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
             ", fallback"
         else
             "";
-        stdio.print(
-            .out,
-            "  {d}: payload @ {d} ({d} bytes, {d} condition(s){s}{s})",
+        stdout.print(
+            "  {d}: payload @ {d} ({d} bytes, {d} condition(s){s}{s})\n",
             .{
                 i,
                 entry.payload_offset,
@@ -79,14 +79,14 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
             const cond_at = @as(u64, entry.condition_offset) +
                 @as(u64, j) * @sizeOf(format.Condition);
             if (cond_at + @sizeOf(format.Condition) > footer.table_offset) {
-                stdio.print(.err, "chonk: {s}: conditions out of range", .{args[0]});
+                stderr.print("chonk: {s}: conditions out of range\n", .{args[0]});
                 return 1;
             }
             const condition = try format.decode(
                 format.Condition,
                 fat[@intCast(cond_at)..],
             );
-            stdio.print(.out, "    {s}", .{describeCondition(arena, condition)});
+            stdout.print("    {s}\n", .{describeCondition(arena, condition)});
         }
     }
     return 0;
