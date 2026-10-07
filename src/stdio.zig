@@ -57,6 +57,6 @@ pub fn writeAll(comptime w: Where, bytes: []const u8) void {
 /// Flush both streams. Main's exit defer calls this; direct
 /// `std.process.exit` callers must call it by hand first.
 pub fn flush() void {
-    stderr.flush() catch undefined;
-    stdout.flush() catch undefined;
+    stderr.flush() catch unreachable;
+    stdout.flush() catch unreachable;
 }
