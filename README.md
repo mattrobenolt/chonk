@@ -202,10 +202,12 @@ part number separates them, and the stub reads `MIDR_EL1` directly.
 ```console
 $ chonk pack <stub> <config.zon> <output>
 $ chonk inspect <binary>
+$ chonk --help
 ```
 
 `pack` concatenates a stub file, the payload binaries from the config, and
 the trailer. `inspect` prints the variant table of an existing fat binary.
+Every command and the top level accept `-h`/`--help`.
 
 The config is ZON, a subset of Zig syntax. It type-checks at parse time:
 a bit name implies its source, and a typo is a parse error with a line

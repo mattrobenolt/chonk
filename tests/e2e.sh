@@ -80,6 +80,22 @@ esac
 mkdir -p .zig-cache/e2e tests/e2e
 cp -f "$(command -v bash)" tests/e2e/bash
 
+# --- help --------------------------------------------------------------------
+
+for flag in --help -h; do
+    run ./zig-out/bin/chonk "$flag"
+    expect_out "usage: chonk <command>" "help: top level $flag"
+    expect_rc 0 "help: top level $flag rc"
+done
+
+run ./zig-out/bin/chonk pack --help
+expect_out "chonk stub for the target architecture" "help: pack"
+expect_rc 0 "help: pack rc"
+
+run ./zig-out/bin/chonk inspect -h
+expect_out "usage: chonk inspect" "help: inspect"
+expect_rc 0 "help: inspect rc"
+
 # --- CLI door: pack-cli.zon --------------------------------------------------
 # Dedup shape: v1 and the fallback share the copied bash. Tracers: sve2
 # tier → chonk usage (exit 2), sve tier → bash marker, fallback → bash

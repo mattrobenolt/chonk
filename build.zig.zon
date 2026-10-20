@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x84b75788676c5de1, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .cli = .{
+            .url = "https://github.com/baskingspot/cli/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "cli-0.1.0-nGM5m0b4AAAQ6VJl6BzyRwsYXIzXPOw7Q14HdW6Tah0o",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

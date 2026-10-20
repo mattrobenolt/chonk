@@ -24,6 +24,7 @@ const assert = std.debug.assert;
 const zon = std.zon;
 const Wyhash = std.hash.Wyhash;
 
+const cli = @import("cli");
 const format = @import("format.zig");
 const stdio = @import("stdio.zig");
 const stderr = stdio.err;
@@ -268,19 +269,32 @@ pub fn midrPart(implementer: u8, part: u12) Match {
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
 // ---------------------------------------------------------------------------
 
+const pack_usage = "usage: chonk pack <stub> <config.zon> <output>\n";
+
+const pack_help = pack_usage ++
+    \\  stub        chonk stub for the target architecture
+    \\  config.zon  variant and payload config
+    \\  output      path for the fat binary
+    \\
+;
+
+const Paths = struct {
+    stub: []const u8,
+    config: []const u8,
+    out: []const u8,
+};
+
 /// `chonk pack <stub> <config.zon> <output>` — the human door. The build
-/// system calls `packAll` in-process as a module instead. args = everything
-/// after the subcommand word; stdio is initialized by the front door.
-pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
+/// system calls `packAll` in-process as a module instead. args is the cursor
+/// positioned after the subcommand word; stdio is initialized by the front
+/// door.
+pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
     const cwd = Io.Dir.cwd();
 
-    if (args.len != 3) {
-        stderr.writeAll("usage: chonk pack <stub> <config.zon> <output>");
-        return error.Usage;
-    }
+    const paths = (try parsePaths(args)) orelse return 0;
 
     // Parse the config. ZON errors print with line:column from diag.
-    const config_bytes = try readFile(io, arena, cwd, args[1]);
+    const config_bytes = try readFile(io, arena, cwd, paths.config);
     const source = try arena.allocSentinel(u8, config_bytes.len, 0);
     @memcpy(source, config_bytes);
     var diag: zon.parse.Diagnostics = .{};
@@ -288,18 +302,52 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
         .free_on_error = false,
     }) catch |err| {
         if (err == error.ParseZon) {
-            stderr.print("chonk: {s}: {f}\n", .{ args[1], &diag });
+            stderr.print("chonk: {s}: {f}\n", .{ paths.config, &diag });
         }
         return error.Config;
     };
 
     // Payload paths are relative to the config's own directory.
-    const config_dir: Io.Dir = if (fs_path.dirname(args[1])) |dir_name|
+    const config_dir: Io.Dir = if (fs_path.dirname(paths.config)) |dir_name|
         try cwd.openDir(io, dir_name, .{})
     else
         cwd;
 
-    return packAll(io, arena, cwd, config_dir, args[2], args[0], config);
+    return packAll(io, arena, cwd, config_dir, paths.out, paths.stub, config);
+}
+
+/// Read the three fixed positionals. `-h`/`--help` prints and returns null;
+/// every other error prints the usage and fails with `error.Usage`.
+fn parsePaths(args: *cli.Args) !?Paths {
+    var paths: [3][]const u8 = undefined;
+    var count: usize = 0;
+
+    while (args.next()) |tok| switch (tok) {
+        .positional => |path| {
+            if (count == paths.len) {
+                stderr.print("chonk: unexpected argument '{s}'\n", .{path});
+                stderr.writeAll(pack_usage);
+                return error.Usage;
+            }
+            paths[count] = path;
+            count += 1;
+        },
+        .option => |opt| {
+            if (opt.isSwitch("help", 'h')) {
+                stdout.writeAll(pack_help);
+                return null;
+            }
+            stderr.print("chonk: unknown option '{f}'\n", .{opt});
+            stderr.writeAll(pack_usage);
+            return error.Usage;
+        },
+    };
+
+    if (count != paths.len) {
+        stderr.writeAll(pack_usage);
+        return error.Usage;
+    }
+    return .{ .stub = paths[0], .config = paths[1], .out = paths[2] };
 }
 
 /// The shared tail of both pack forms: read + check the stub, validate the

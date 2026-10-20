@@ -11,26 +11,56 @@ const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 
+const cli = @import("cli");
 const format = @import("format.zig");
 const pack = @import("pack.zig");
 const stdio = @import("stdio.zig");
 const stderr = stdio.err;
 const stdout = stdio.out;
 
-/// `chonk inspect <binary>`. args = everything after the subcommand word.
-pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
-    if (args.len != 1) {
-        stderr.writeAll("usage: chonk inspect <binary>");
-        return error.Usage;
-    }
+const inspect_usage = "usage: chonk inspect <binary>\n";
 
-    const fat = try pack.readFile(io, arena, Io.Dir.cwd(), args[0]);
+const inspect_help = inspect_usage ++
+    \\  binary      chonk fat binary to print
+    \\
+;
+
+/// `chonk inspect <binary>`. args is the cursor positioned after the
+/// subcommand word.
+pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
+    var maybe_path: ?[]const u8 = null;
+    while (args.next()) |tok| switch (tok) {
+        .positional => |value| {
+            if (maybe_path != null) {
+                stderr.print("chonk: unexpected argument '{s}'\n", .{value});
+                stderr.writeAll(inspect_usage);
+                return error.Usage;
+            }
+            maybe_path = value;
+        },
+        .option => |opt| {
+            if (opt.isSwitch("help", 'h')) {
+                stdout.writeAll(inspect_help);
+                return 0;
+            }
+            stderr.print("chonk: unknown option '{f}'\n", .{opt});
+            stderr.writeAll(inspect_usage);
+            return error.Usage;
+        },
+    };
+
+    const path = maybe_path orelse {
+        stderr.writeAll(inspect_usage);
+        return error.Usage;
+    };
+
+    const fat = try pack.readFile(io, arena, Io.Dir.cwd(), path);
     const footer = format.findFooter(fat) catch |err| {
-        stderr.print("chonk: {s}: not a chonk binary ({s})\n", .{ args[0], @errorName(err) });
+        stderr.print("chonk: {s}: not a chonk binary ({s})\n", .{ path, @errorName(err) });
         return 1;
     };
 
-    stdout.print("{s}: chonk fat binary\n", .{args[0]});
+    stdout.print("{s}: chonk fat binary\n", .{path});
     stdout.print(
         "  format version {d}, machine {s}, {d} variants, total {d} bytes",
         .{ footer.format_version, machineName(footer.machine), footer.variant_count, fat.len },
@@ -40,7 +70,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
     // footer. Widen before arithmetic — the trailer is untrusted.
     const count = @as(u64, footer.variant_count) * @sizeOf(format.VariantEntry);
     if (footer.table_offset + count > fat.len - @as(u64, @sizeOf(format.Footer))) {
-        stderr.print("chonk: {s}: entry table out of range\n", .{args[0]});
+        stderr.print("chonk: {s}: entry table out of range\n", .{path});
         return 1;
     }
 
@@ -79,7 +109,7 @@ pub fn run(io: Io, arena: Allocator, args: []const [:0]const u8) !u8 {
             const cond_at = @as(u64, entry.condition_offset) +
                 @as(u64, j) * @sizeOf(format.Condition);
             if (cond_at + @sizeOf(format.Condition) > footer.table_offset) {
-                stderr.print("chonk: {s}: conditions out of range\n", .{args[0]});
+                stderr.print("chonk: {s}: conditions out of range\n", .{path});
                 return 1;
             }
             const condition = try format.decode(

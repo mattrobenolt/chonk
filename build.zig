@@ -22,6 +22,8 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const cli_dep = b.dependency("cli", .{ .target = target });
+
     const exe = b.addExecutable(.{
         .name = "chonk",
         .root_module = b.createModule(.{
@@ -32,6 +34,7 @@ pub fn build(b: *Build) void {
             .single_threaded = true,
         }),
     });
+    exe.root_module.addImport("cli", cli_dep.module("cli"));
 
     b.installArtifact(exe);
 
