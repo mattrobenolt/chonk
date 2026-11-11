@@ -115,22 +115,23 @@ comptime {
 /// and are copied as-is.
 pub fn encode(comptime T: type, value: T) [@sizeOf(T)]u8 {
     var out: [@sizeOf(T)]u8 = @splat(0);
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const offset: usize = @offsetOf(T, field.name);
-        switch (@typeInfo(field.type)) {
-            .int => |info| {
-                const byte_count = @divExact(info.bits, 8);
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        const offset: usize = @offsetOf(T, field_name);
+        switch (@typeInfo(field_type)) {
+            .int => |int_info| {
+                const byte_count = @divExact(int_info.bits, 8);
                 writeInt(
-                    field.type,
+                    field_type,
                     out[offset .. offset + byte_count],
-                    @field(value, field.name),
+                    @field(value, field_name),
                 );
             },
-            .@"enum" => out[offset] = @intFromEnum(@field(value, field.name)),
-            .array => |info| if (info.child == u8) {
-                @memcpy(out[offset .. offset + info.len], &@field(value, field.name));
-            } else @compileError("format: unsupported array field " ++ field.name),
-            else => @compileError("format: unsupported field type " ++ @typeName(field.type)),
+            .@"enum" => out[offset] = @backingInt(@field(value, field_name)),
+            .array => |array_info| if (array_info.child == u8) {
+                @memcpy(out[offset .. offset + array_info.len], &@field(value, field_name));
+            } else @compileError("format: unsupported array field " ++ field_name),
+            else => @compileError("format: unsupported field type " ++ @typeName(field_type)),
         }
     }
     return out;
@@ -141,29 +142,30 @@ pub fn encode(comptime T: type, value: T) [@sizeOf(T)]u8 {
 pub fn decode(comptime T: type, bytes: []const u8) Error!T {
     if (bytes.len < @sizeOf(T)) return error.Truncated;
     var result: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const offset: usize = @offsetOf(T, field.name);
-        switch (@typeInfo(field.type)) {
-            .int => |info| {
-                const byte_count = @divExact(info.bits, 8);
-                @field(result, field.name) = readInt(
-                    field.type,
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        const offset: usize = @offsetOf(T, field_name);
+        switch (@typeInfo(field_type)) {
+            .int => |int_info| {
+                const byte_count = @divExact(int_info.bits, 8);
+                @field(result, field_name) = readInt(
+                    field_type,
                     bytes[offset .. offset + byte_count],
                 );
             },
-            .@"enum" => @field(result, field.name) = try enumFromByte(field.type, bytes[offset]),
-            .array => |info| if (info.child == u8) {
-                @memcpy(&@field(result, field.name), bytes[offset .. offset + info.len]);
-            } else @compileError("format: unsupported array field " ++ field.name),
-            else => @compileError("format: unsupported field type " ++ @typeName(field.type)),
+            .@"enum" => @field(result, field_name) = try enumFromByte(field_type, bytes[offset]),
+            .array => |array_info| if (array_info.child == u8) {
+                @memcpy(&@field(result, field_name), bytes[offset .. offset + array_info.len]);
+            } else @compileError("format: unsupported array field " ++ field_name),
+            else => @compileError("format: unsupported field type " ++ @typeName(field_type)),
         }
     }
     return result;
 }
 
 fn enumFromByte(comptime E: type, raw: u8) Error!E {
-    inline for (@typeInfo(E).@"enum".fields) |field| {
-        if (field.value == raw) return @enumFromInt(raw);
+    inline for (@typeInfo(E).@"enum".field_values) |field_value| {
+        if (field_value == raw) return @fromBackingInt(raw);
     }
     return error.InvalidSource;
 }
@@ -281,7 +283,7 @@ test "findFooter at EOF" {
         .table_offset = 8,
         .variant_count = 2,
         .format_version = format_version,
-        .machine = @intFromEnum(std.elf.EM.AARCH64),
+        .machine = @backingInt(std.elf.EM.AARCH64),
     };
     const footer_bytes = encode(Footer, footer);
     var fat: [payload.len + footer_bytes.len]u8 = undefined;
@@ -291,7 +293,7 @@ test "findFooter at EOF" {
 }
 
 test "findFooter rejects short file, bad magic, bad version" {
-    try testing.expectError(error.Truncated, findFooter(&([_]u8{0} ** 23)));
+    try testing.expectError(error.Truncated, findFooter(&@as([23]u8, @splat(0))));
     const no_magic: [@sizeOf(Footer)]u8 = @splat(0);
     try testing.expectError(error.BadMagic, findFooter(&no_magic));
     const old_version = encode(Footer, .{

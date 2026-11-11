@@ -30,7 +30,7 @@ pub fn build(b: *Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .single_threaded = true,
         }),
     });
@@ -59,7 +59,7 @@ pub fn build(b: *Build) void {
                     .cpu_arch = stub_spec[1],
                     .os_tag = .freestanding,
                 }),
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
                 .strip = true,
                 .single_threaded = true,
             }),
@@ -76,7 +76,7 @@ pub fn build(b: *Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

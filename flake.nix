@@ -34,8 +34,8 @@
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
-              zig_0_16
-              zls_0_16
+              zig_0_17
+              zls_0_17
               ziglint
               zigdoc
               qemu-user

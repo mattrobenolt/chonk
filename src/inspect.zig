@@ -124,8 +124,8 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
 
 fn machineName(machine: u16) []const u8 {
     return switch (machine) {
-        @intFromEnum(std.elf.EM.AARCH64) => "aarch64",
-        @intFromEnum(std.elf.EM.X86_64) => "x86_64",
+        @backingInt(std.elf.EM.AARCH64) => "aarch64",
+        @backingInt(std.elf.EM.X86_64) => "x86_64",
         else => "unknown",
     };
 }
@@ -159,7 +159,7 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
             // feature names the table is keyed by.
             inline for (pack.x86_table) |e| {
                 if (e.cpuid.leaf == leaf and e.cpuid.subleaf == subleaf and
-                    @intFromEnum(e.cpuid.register) == reg and e.cpuid.bit == bit)
+                    @backingInt(e.cpuid.register) == reg and e.cpuid.bit == bit)
                 {
                     return @tagName(e.feature);
                 }
@@ -226,7 +226,7 @@ test "describeCondition names known values, raw otherwise" {
         "avx2",
         describeCondition(arena, .{
             .mask = (@as(u64, 7) << 32) | 0,
-            .expected = (@as(u64, @intFromEnum(pack.Cpuid.Register.ebx)) << 5) | 5,
+            .expected = (@as(u64, @backingInt(pack.Cpuid.Register.ebx)) << 5) | 5,
             .source = .cpuid,
         }),
     );

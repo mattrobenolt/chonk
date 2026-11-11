@@ -2,11 +2,11 @@
     .name = .chonk,
     .version = "0.0.0",
     .fingerprint = 0x84b75788676c5de1, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .cli = .{
-            .url = "https://baskingspot.dev/cli/v0.1.0.tar.gz",
-            .hash = "cli-0.1.0-nGM5m0b4AAAQ6VJl6BzyRwsYXIzXPOw7Q14HdW6Tah0o",
+            .url = "https://baskingspot.dev/cli/v0.3.1.tar.gz",
+            .hash = "cli-0.3.1-nGM5m-sVAQB7tupXqokmZpPHajiV5eZPcbUVDRvGgNPb",
         },
     },
     .paths = .{

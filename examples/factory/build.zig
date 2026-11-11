@@ -19,14 +19,14 @@ pub fn build(b: *Build) void {
     const fallback_mod = b.createModule(.{
         .root_source_file = b.path("src/fallback.zig"),
         .target = b.resolveTargetQuery(target),
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     fallback_exe = b.addExecutable(.{ .name = "fallback", .root_module = fallback_mod });
 
     const fat = chonk.addExecutable(b, .{
         .name = "app",
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
         .make_exe = makeExe,
         .post_process = postProcess,
         .targets = &.{

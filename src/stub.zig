@@ -17,10 +17,20 @@ const builtin = @import("builtin");
 const format = @import("format.zig");
 const x86 = @import("x86.zig");
 
+/// The auxv record types this stub reads. `std.elf.AT` is keyed by OS, and a
+/// freestanding target falls to the set that stops at NOTELF, so the Linux
+/// ABI values live here.
+const at = struct {
+    const terminator = 0;
+    const hwcap = 16;
+    const hwcap2 = 26;
+    const execfn = 31;
+};
+
 /// This stub's species — selected at comptime by the build target.
 const my_machine: u16 = switch (builtin.cpu.arch) {
-    .aarch64 => @intFromEnum(elf.EM.AARCH64),
-    .x86_64 => @intFromEnum(elf.EM.X86_64),
+    .aarch64 => @backingInt(elf.EM.AARCH64),
+    .x86_64 => @backingInt(elf.EM.X86_64),
     else => @compileError("chonk stub: unsupported arch"),
 };
 
@@ -97,11 +107,11 @@ fn walk(argc_argv_ptr: [*]usize) callconv(.c) noreturn {
     var hwcap: u64 = 0;
     var hwcap2: u64 = 0;
     var i: usize = 0;
-    while (auxv[i].a_type != elf.AT_NULL) : (i += 1) {
+    while (auxv[i].a_type != at.terminator) : (i += 1) {
         switch (auxv[i].a_type) {
-            elf.AT_EXECFN => execfn = @ptrFromInt(auxv[i].a_un.a_val),
-            elf.AT_HWCAP => hwcap = auxv[i].a_un.a_val,
-            elf.AT_HWCAP2 => hwcap2 = auxv[i].a_un.a_val,
+            at.execfn => execfn = @ptrFromInt(auxv[i].a_un.a_val),
+            at.hwcap => hwcap = auxv[i].a_un.a_val,
+            at.hwcap2 => hwcap2 = auxv[i].a_un.a_val,
             else => {},
         }
     }

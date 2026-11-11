@@ -2,11 +2,10 @@ const std = @import("std");
 const Build = std.Build;
 const LazyPath = Build.LazyPath;
 const Step = Build.Step;
-const Io = std.Io;
 const Target = std.Target;
 const aarch64 = Target.aarch64;
 const x86 = Target.x86;
-const OptimizeMode = std.builtin.OptimizeMode;
+const Optimize = std.lang.Optimize;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const resolveTargetQuery = std.zig.system.resolveTargetQuery;
@@ -17,7 +16,6 @@ const pack = @import("pack.zig");
 pub const Match = pack.Match;
 pub const midrPart = pack.midrPart;
 pub const Bit = pack.Bit;
-const stdio = @import("stdio.zig");
 const x86_probe = @import("x86.zig");
 
 // ---------------------------------------------------------------------------
@@ -119,9 +117,9 @@ fn modelArch(model: *const Target.Cpu.Model) ?Target.Cpu.Arch {
     inline for (tables) |t| {
         const arch = t[0];
         const ns = t[1];
-        inline for (comptime @typeInfo(ns).@"struct".decls) |decl| {
-            if (@TypeOf(@field(ns, decl.name)) == Target.Cpu.Model) {
-                if (&@field(ns, decl.name) == model) return arch;
+        inline for (comptime @typeInfo(ns).@"struct".decl_names) |decl_name| {
+            if (@TypeOf(@field(ns, decl_name)) == Target.Cpu.Model) {
+                if (&@field(ns, decl_name) == model) return arch;
             }
         }
     }
@@ -153,7 +151,7 @@ fn targetMatches(arena: Allocator, target: Target, spec: TargetSpec) []const pac
 pub const Variant = struct {
     name: []const u8,
     target: Build.ResolvedTarget,
-    optimize: OptimizeMode,
+    optimize: Optimize,
 };
 
 /// The consumer's per-variant executable factory (#1). Real builds wire
@@ -198,7 +196,7 @@ pub const ExecutableOptions = struct {
     /// unambiguously means the skeleton arch's baseline, never "native
     /// on the build machine".
     targets: []const TargetSpec,
-    optimize: OptimizeMode = .Debug,
+    optimize: Optimize = .debug,
     /// Wire the zig-out/bin/<name> install.
     install: bool = true,
 };
@@ -330,35 +328,26 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         }
     }
 
-    // The freestanding stub for THIS species, compiled into THIS build
-    // graph from source. Compiled-once-forever: always ReleaseSmall +
-    // stripped, regardless of the consumer's optimize setting. The
+    // The stub for THIS species, compiled by chonk's own build (always
+    // ReleaseSmall + stripped, compiled once for every consumer). The
     // skeleton's resolved arch decides.
     const dep = b.dependency("chonk", .{});
     const species = b.resolveTargetQuery(options.target).result.cpu.arch;
-    const stub_target: Target.Query = switch (species) {
-        .aarch64 => .{ .cpu_arch = .aarch64, .os_tag = .freestanding },
-        .x86_64 => .{ .cpu_arch = .x86_64, .os_tag = .freestanding },
+    const stub = dep.artifact(switch (species) {
+        .aarch64 => "stub-aarch64",
+        .x86_64 => "stub-x86_64",
         else => @panic("chonk.addExecutable: unsupported arch"),
-    };
-    const stub = b.addExecutable(.{
-        .name = "stub",
-        .root_module = b.createModule(.{
-            .root_source_file = dep.path("src/stub.zig"),
-            .target = b.resolveTargetQuery(stub_target),
-            .optimize = .ReleaseSmall,
-            .strip = true,
-            .single_threaded = true,
-        }),
     });
-    stub.entry = .enabled;
 
-    // The post-compile hook (#5): called once per variant with what
-    // make_exe/root_source_file built; the returned LazyPath is what gets
-    // packed. A Run-step output rewrites the payload between compile and
-    // pack; `payload` passes through unchanged.
-    const pack_step = b.allocator.create(PackStep) catch @panic("OOM");
-    const inputs = b.allocator.alloc(PackStep.Input, variants.len) catch @panic("OOM");
+    // The pack is the CLI's work: 0.17 executes a fixed set of steps by tag,
+    // so a build script has no way to run code itself. The payloads and the
+    // stub are copied into one generated directory beside a config that
+    // names them, and `chonk pack` writes the fat binary as the run step's
+    // output file. The run step's manifest hashes the argv, the copied
+    // payloads, the stub, and the config text, so a changed payload, match,
+    // or stub re-packs.
+    const files = b.addWriteFiles();
+    const files_variants = b.allocator.alloc(pack.Variant, variants.len) catch @panic("OOM");
     for (variants, 0..) |t, i| {
         var payload = exes[i].getEmittedBin();
         if (options.post_process) |post| {
@@ -368,42 +357,25 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
                 .optimize = options.optimize,
             }, payload);
         }
-        inputs[i] = .{
+        const sub_path = b.fmt("payload-{d}", .{i});
+        _ = files.addCopyFile(payload, sub_path);
+        files_variants[i] = .{
             .name = t.name,
-            .payload = payload,
+            .binary = sub_path,
             .match = t.match,
         };
     }
-    pack_step.* = .{
-        .step = Step.init(.{
-            .id = .custom,
-            .name = b.fmt("chonk pack {s}", .{options.name}),
-            .owner = b,
-            .makeFn = PackStep.make,
-        }),
-        .fat = .{ .step = &pack_step.step },
-        .out_name = options.name,
-        .stub = stub.getEmittedBin(),
-        .inputs = inputs,
-    };
+    const config = files.add(
+        "config.zon",
+        pack.configZon(b.allocator, .{ .variants = files_variants }),
+    );
 
-    // The pack runs after the stub + every variant compiles + every
-    // hook output's producer. LazyPath carries no step accessor in 0.16,
-    // so pull the producer off the generated tag; static paths have no
-    // producer.
-    pack_step.step.dependOn(&stub.step);
-    for (exes) |exe| {
-        pack_step.step.dependOn(&exe.step);
-    }
-    for (inputs) |input| {
-        if (producerStep(input.payload)) |producer| {
-            pack_step.step.dependOn(producer);
-        }
-    }
+    const pack_cmd = b.addRunArtifact(dep.artifact("chonk"));
+    pack_cmd.addArg("pack");
+    pack_cmd.addFileArg(files.addCopyFile(stub.getEmittedBin(), "stub"));
+    pack_cmd.addFileArg(config);
+    const fat = pack_cmd.addOutputFileArg(options.name);
 
-    const fat: LazyPath = .{ .generated = .{ .file = &pack_step.fat } };
-    // addInstallFile* creates the step but does not wire it — the
-    // lowercase install helpers wire but take static paths only.
     if (options.install) {
         const install = b.addInstallFileWithDir(fat, .bin, options.name);
         b.getInstallStep().dependOn(&install.step);
@@ -411,18 +383,6 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
     return fat;
 }
 
-/// The step that produces a LazyPath, for generated paths; static paths
-/// (src, cwd, dependency) have no producer — the file exists by pack time
-/// or the pack fails.
-fn producerStep(payload: LazyPath) ?*Step {
-    return switch (payload) {
-        .generated => |g| g.file.step,
-        else => null,
-    };
-}
-
-/// Packs a fat binary in-process: the same module the CLI uses, run by the
-/// build runner with b.graph.io — no subprocess, no argv marshalling.
 /// One resolved target: the auto-name, the resolved query, the inferred
 /// dispatch bits, and whether it is the arch-baseline fallback.
 const ResolvedTarget = struct {
@@ -430,93 +390,6 @@ const ResolvedTarget = struct {
     resolved: Build.ResolvedTarget,
     match: []const pack.Match,
     fallback: bool,
-};
-
-/// Hash one match into a manifest — the match's full meaning, so a
-/// condition change re-packs.
-fn hashMatch(man: *Build.Cache.Manifest, m: pack.Match) void {
-    if (m.bit) |bit| {
-        man.hash.addBytes(@tagName(bit));
-    } else if (m.cpuid) |c| {
-        man.hash.add(c.leaf);
-        man.hash.add(c.subleaf);
-        man.hash.add(@intFromEnum(c.register));
-        man.hash.add(c.bit);
-    } else if (m.source) |source| {
-        man.hash.add(@intFromEnum(source));
-        if (m.mask) |mask| man.hash.add(mask);
-        if (m.expected) |expected| man.hash.add(expected);
-    } else {
-        man.hash.addBytes("(unconditional)");
-    }
-}
-
-const PackStep = struct {
-    step: Step,
-    fat: Build.GeneratedFile,
-    out_name: []const u8,
-    stub: LazyPath,
-    inputs: []Input,
-
-    const Input = struct {
-        name: []const u8,
-        payload: LazyPath,
-        /// Empty = the fallback.
-        match: []const pack.Match,
-    };
-
-    fn make(step: *Step, options: Step.MakeOptions) anyerror!void {
-        _ = options;
-
-        defer stdio.flush();
-        const b = step.owner;
-        const io = b.graph.io;
-        const arena = b.allocator;
-        const self: *PackStep = @fieldParentPtr("step", step);
-
-        // Manifest: the output name, every input file, and the conditions.
-        var man = b.graph.cache.obtain();
-        defer man.deinit();
-        man.hash.addBytes(self.out_name);
-        _ = try man.addFilePath(self.stub.getPath3(b, step), null);
-        for (self.inputs) |input| {
-            man.hash.addBytes(input.name);
-            for (input.match) |m| {
-                hashMatch(&man, m);
-            }
-            man.hash.addBytes("(end)");
-            _ = try man.addFilePath(input.payload.getPath3(b, step), null);
-        }
-
-        if (try step.cacheHit(&man)) {
-            const digest = man.final();
-            self.fat.path = try b.cache_root.join(arena, &.{ "o", &digest, self.out_name });
-            return;
-        }
-        const digest = man.final();
-        const dir_sub = b.fmt("o/{s}", .{&digest});
-        self.fat.path = try b.cache_root.join(arena, &.{ dir_sub, self.out_name });
-
-        // A canonical cache home for the fat binary.
-        b.cache_root.handle.createDirPath(io, dir_sub) catch |err| {
-            return step.fail("create cache dir: {s}", .{@errorName(err)});
-        };
-
-        const stub_path = self.stub.getPath2(b, step);
-        const cwd = Io.Dir.cwd();
-        const variants = try arena.alloc(pack.Variant, self.inputs.len);
-        for (self.inputs, 0..) |input, i| {
-            variants[i] = .{
-                .name = input.name,
-                .binary = input.payload.getPath2(b, step),
-                .match = input.match,
-            };
-        }
-        _ = try pack.packAll(io, arena, cwd, cwd, self.fat.path.?, stub_path, .{
-            .variants = variants,
-        });
-        try step.writeManifest(&man);
-    }
 };
 
 test "extra_match retains inferred ISA checks and owns caller conditions" {

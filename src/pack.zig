@@ -85,6 +85,55 @@ pub const Cpuid = struct {
     pub const Register = enum(u8) { eax, ebx, ecx, edx };
 };
 
+/// Renders `config` as the ZON text `chonk pack` reads.
+///
+/// The build-system integration copies the payloads into one generated
+/// directory with this file beside them and hands the pair to the CLI, so
+/// the field names have one definition — here, next to the types they name —
+/// and the writer cannot drift from the parser.
+pub fn configZon(arena: Allocator, config: Config) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.print(arena, ".{{ .variants = .{{\n", .{}) catch @panic("OOM");
+    for (config.variants) |v| {
+        out.print(arena, "    .{{ .binary = {q}", .{v.binary}) catch @panic("OOM");
+        if (v.name) |name| out.print(arena, ", .name = {q}", .{name}) catch @panic("OOM");
+        if (v.match.len > 0) {
+            out.print(arena, ", .match = .{{", .{}) catch @panic("OOM");
+            for (v.match) |m| writeMatch(arena, &out, m);
+            out.print(arena, " }}", .{}) catch @panic("OOM");
+        }
+        out.print(arena, " }},\n", .{}) catch @panic("OOM");
+    }
+    out.print(arena, "}} }}\n", .{}) catch @panic("OOM");
+    return out.toOwnedSlice(arena) catch @panic("OOM");
+}
+
+/// One condition, in the raw form the parser validates: a missing mask or
+/// expected value is a build-script bug, not a value to paper over with 0.
+fn writeMatch(arena: Allocator, out: *std.ArrayList(u8), m: Match) void {
+    if (m.bit) |bit| {
+        out.print(arena, " .{{ .bit = .{t} }},", .{bit}) catch @panic("OOM");
+    } else if (m.cpuid) |c| {
+        out.print(
+            arena,
+            " .{{ .cpuid = .{{ .leaf = {d}, .subleaf = {d}, .register = .{t}, .bit = {d} }} }},",
+            .{ c.leaf, c.subleaf, c.register, c.bit },
+        ) catch @panic("OOM");
+    } else if (m.source) |source| {
+        out.print(
+            arena,
+            " .{{ .source = .{t}, .mask = {d}, .expected = {d} }},",
+            .{
+                source,
+                m.mask orelse @panic("chonk: raw match without a mask"),
+                m.expected orelse @panic("chonk: raw match without an expected value"),
+            },
+        ) catch @panic("OOM");
+    } else {
+        @panic("chonk: match with no condition");
+    }
+}
+
 /// One x86_64 vocabulary entry: the Zig target feature and the CPUID
 /// location that advertises it. The CPUID locations are hand-pinned from
 /// the x86-64 psABI / Intel SDM — Zig carries no CPUID table, so comptime
@@ -297,12 +346,15 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
     const config_bytes = try readFile(io, arena, cwd, paths.config);
     const source = try arena.allocSentinel(u8, config_bytes.len, 0);
     @memcpy(source, config_bytes);
-    var diag: zon.parse.Diagnostics = .{};
-    const config = zon.parse.fromSliceAlloc(Config, arena, source, &diag, .{
-        .free_on_error = false,
+    var diag: zon.parse.Diagnostics = undefined;
+    const config = zon.parse.fromSlice(Config, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &diag,
     }) catch |err| {
         if (err == error.ParseZon) {
-            stderr.print("chonk: {s}: {f}\n", .{ paths.config, &diag });
+            stderr.print("chonk: {f}\n", .{diag.fmt(paths.config)});
         }
         return error.Config;
     };
@@ -607,7 +659,7 @@ fn compileMatches(arena: Allocator, v: NamedVariant) ![]const format.Condition {
             // expected = (register << 5) | bit. The stub requires the bit set.
             out[i] = .{
                 .mask = (@as(u64, c.leaf) << 32) | c.subleaf,
-                .expected = (@as(u64, @intFromEnum(c.register)) << 5) | c.bit,
+                .expected = (@as(u64, @backingInt(c.register)) << 5) | c.bit,
                 .source = .cpuid,
             };
         } else if (m.bit) |bit| {
@@ -685,8 +737,8 @@ fn elfCheck(path: []const u8, bytes: []const u8) error{NotAnElf}!ElfIdentity {
     const entry = format.readInt(u64, bytes[e_entry_off..][0..8]);
     return .{
         .machine = format.readInt(u16, bytes[e_machine_off..][0..2]),
-        .is_program = (e_type == @intFromEnum(elf.ET.EXEC) or
-            e_type == @intFromEnum(elf.ET.DYN)) and entry != 0,
+        .is_program = (e_type == @backingInt(elf.ET.EXEC) or
+            e_type == @backingInt(elf.ET.DYN)) and entry != 0,
     };
 }
 
@@ -925,11 +977,14 @@ test "config parses from ZON" {
     ;
     const buf = try arena.allocSentinel(u8, source.len, 0);
     @memcpy(buf, source);
-    var diag: zon.parse.Diagnostics = .{};
-    const config = zon.parse.fromSliceAlloc(Config, arena, buf, &diag, .{
-        .free_on_error = false,
+    var diag: zon.parse.Diagnostics = undefined;
+    const config = zon.parse.fromSlice(Config, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = buf,
+        .diagnostics = &diag,
     }) catch |err| {
-        stderr.print("parse failed: {f}\n", .{&diag});
+        stderr.print("parse failed: {f}\n", .{diag.fmt("config.zon")});
         return err;
     };
 
@@ -946,6 +1001,59 @@ test "config parses from ZON" {
     const named = try normalizeConfig(arena, config);
     try testing.expectEqualStrings("app-generic", named[1].name);
     try testing.expectEqualStrings("neoverse-v2", named[0].name);
+}
+
+test "configZon writes a config the parser reads back" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const written = configZon(arena, .{
+        .variants = &.{
+            .{
+                .name = "neoverse-v2",
+                .binary = "payload-0",
+                .match = &.{
+                    .{ .bit = .sve2 },
+                    .{ .source = .hwcap, .mask = 0x400000, .expected = 0x400000 },
+                },
+            },
+            .{
+                .name = "turin",
+                .binary = "payload-1",
+                .match = &.{
+                    .{ .cpuid = .{ .leaf = 7, .subleaf = 0, .register = .ebx, .bit = 16 } },
+                    .{ .source = .xcr0, .mask = 0xe6, .expected = 0xe6 },
+                },
+            },
+            .{ .binary = "payload-2" },
+        },
+    });
+    const source = try arena.allocSentinel(u8, written.len, 0);
+    @memcpy(source, written);
+    var diag: zon.parse.Diagnostics = undefined;
+    const config = zon.parse.fromSlice(Config, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &diag,
+    }) catch |err| {
+        stderr.print("parse failed: {f}\n", .{diag.fmt("config.zon")});
+        return err;
+    };
+
+    try testing.expectEqual(@as(usize, 3), config.variants.len);
+    try testing.expectEqualStrings("neoverse-v2", config.variants[0].name.?);
+    try testing.expectEqualStrings("payload-0", config.variants[0].binary);
+    try testing.expectEqual(Bit.sve2, config.variants[0].match[0].bit.?);
+    try testing.expectEqual(@as(u64, 0x400000), config.variants[0].match[1].mask.?);
+    try testing.expectEqual(@as(u32, 7), config.variants[1].match[0].cpuid.?.leaf);
+    try testing.expectEqual(Cpuid.Register.ebx, config.variants[1].match[0].cpuid.?.register);
+    try testing.expectEqual(@as(u5, 16), config.variants[1].match[0].cpuid.?.bit);
+    try testing.expectEqual(format.Source.xcr0, config.variants[1].match[1].source.?);
+    // The fallback keeps no name and no conditions.
+    try testing.expect(config.variants[2].name == null);
+    try testing.expectEqual(@as(usize, 0), config.variants[2].match.len);
 }
 
 test "compileMatches: bit name implies source and expected" {
@@ -997,14 +1105,13 @@ test "ZON rejects unknown bits at parse time" {
     ;
     const buf = try arena.allocSentinel(u8, source.len, 0);
     @memcpy(buf, source);
-    var diag: zon.parse.Diagnostics = .{};
-    try testing.expectError(error.ParseZon, zon.parse.fromSliceAlloc(
-        Config,
-        arena,
-        buf,
-        &diag,
-        .{ .free_on_error = false },
-    ));
+    var diag: zon.parse.Diagnostics = undefined;
+    try testing.expectError(error.ParseZon, zon.parse.fromSlice(Config, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = buf,
+        .diagnostics = &diag,
+    }));
 }
 
 test "compileMatches: rejects mixed and incomplete forms" {
@@ -1049,22 +1156,22 @@ test "elfCheck: machine + program-ness" {
     // EXEC with an entry: a program.
     var prog: [64]u8 = @splat(0xAA);
     prog[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, prog[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
-    format.writeInt(u16, prog[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, prog[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, prog[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, prog[e_entry_off..][0..8], 0x1000);
     const ident = try elfCheck("prog", &prog);
-    try testing.expectEqual(@intFromEnum(elf.EM.AARCH64), ident.machine);
+    try testing.expectEqual(@backingInt(elf.EM.AARCH64), ident.machine);
     try testing.expect(ident.is_program);
 
     // DYN (shared object) with no entry: not a program — the libm lesson.
     var lib: [64]u8 = @splat(0xBB);
     lib[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, lib[e_type_off..][0..2], @intFromEnum(elf.ET.DYN));
-    format.writeInt(u16, lib[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, lib[e_type_off..][0..2], @backingInt(elf.ET.DYN));
+    format.writeInt(u16, lib[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, lib[e_entry_off..][0..8], 0);
     try testing.expect(!(try elfCheck("lib", &lib)).is_program);
 
-    const not_elf = [_]u8{0} ** 64;
+    const not_elf: [64]u8 = @splat(0);
     try testing.expectError(error.NotAnElf, elfCheck("payload", &not_elf));
 }
 
@@ -1081,14 +1188,14 @@ test "writeFat: dedups identical payload bytes" {
     const e_entry_off = @offsetOf(elf.Elf64_Ehdr, "e_entry");
     var payload: [64]u8 = @splat(0xCC);
     payload[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, payload[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
-    format.writeInt(u16, payload[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, payload[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, payload[e_entry_off..][0..8], 0x1000);
 
     var payload_other: [64]u8 = @splat(0xDD);
     payload_other[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, payload_other[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
-    format.writeInt(u16, payload_other[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, payload_other[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload_other[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, payload_other[e_entry_off..][0..8], 0x1000);
 
     // Write the payloads to real files — writeFat streams from paths.
@@ -1134,7 +1241,7 @@ test "writeFat: dedups identical payload bytes" {
         tmp.dir,
         "fat.bin",
         &payload,
-        @intFromEnum(elf.EM.AARCH64),
+        @backingInt(elf.EM.AARCH64),
         &loaded,
     );
     var arena2: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1176,16 +1283,16 @@ test "writeFat: two-variant round-trip through a real file" {
     const stub: [100]u8 = @splat(0xAA);
     var payload_0: [300]u8 = @splat(0xB0);
     payload_0[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, payload_0[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
-    format.writeInt(u16, payload_0[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, payload_0[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload_0[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, payload_0[e_entry_off..][0..8], 0x1000);
     var payload_1: [37]u8 = @splat(0xB1);
     payload_1[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
-    format.writeInt(u16, payload_1[e_type_off..][0..2], @intFromEnum(elf.ET.EXEC));
-    format.writeInt(u16, payload_1[e_machine_off..][0..2], @intFromEnum(elf.EM.AARCH64));
+    format.writeInt(u16, payload_1[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload_1[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, payload_1[e_entry_off..][0..8], 0x1000);
 
-    const machine = @intFromEnum(elf.EM.AARCH64);
+    const machine = @backingInt(elf.EM.AARCH64);
     // Payloads by reference — writeFat streams from files, so write the
     // bytes out and reference them.
     try tmp.dir.writeFile(io, .{ .sub_path = "p0", .data = &payload_0 });
