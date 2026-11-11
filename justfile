@@ -24,4 +24,4 @@ lint-actions:
 # Check that GitHub Actions references are SHA-pinned with valid version
 # comments.
 pinact-check:
-    pinact run -check --verify -min-age 3 .github/workflows/*.yaml .github/actions/*/action.y*
+    pinact run --check --verify --min-age 3 .github/workflows/*.yaml .github/actions/*/action.y*
