@@ -19,7 +19,6 @@ const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 const elf = std.elf;
-const fs_path = std.fs.path;
 const assert = std.debug.assert;
 const zon = std.zon;
 const Wyhash = std.hash.Wyhash;
@@ -360,7 +359,7 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
     };
 
     // Payload paths are relative to the config's own directory.
-    const config_dir: Io.Dir = if (fs_path.dirname(paths.config)) |dir_name|
+    const config_dir: Io.Dir = if (Io.Dir.path.dirname(paths.config)) |dir_name|
         try cwd.openDir(io, dir_name, .{})
     else
         cwd;
@@ -485,7 +484,7 @@ fn normalizeConfig(arena: Allocator, config: Config) Allocator.Error![]NamedVari
     const variants = try arena.alloc(NamedVariant, config.variants.len);
     for (config.variants, 0..) |v, i| {
         variants[i] = .{
-            .name = v.name orelse fs_path.basename(v.binary),
+            .name = v.name orelse Io.Dir.path.basename(v.binary),
             .binary = v.binary,
             .match = v.match,
         };

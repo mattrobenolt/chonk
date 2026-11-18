@@ -31,10 +31,10 @@ const x86_probe = @import("x86.zig");
 /// Infer the dispatch conditions from a target: every inferable condition
 /// whose feature the target has and the arch baseline lacks. aarch64
 /// yields named hwcap bits. x86_64 yields CPUID features and the required XCR0 state.
-fn inferMatches(arena: Allocator, target: Target) []const pack.Match {
+fn inferMatches(arena: Allocator, target: Target) []const Match {
     const cpu = target.cpu;
     const baseline = Target.Cpu.baseline(cpu.arch, target.os);
-    var matches: std.ArrayList(pack.Match) = .empty;
+    var matches: std.ArrayList(Match) = .empty;
     switch (cpu.arch) {
         // One table read (pack.aarch64_table): wire form + Zig feature
         // together, comptime-uniqueness-checked. A bit with no Zig feature
@@ -111,8 +111,8 @@ fn isBaseline(target: Target) bool {
 /// model from another arch silently builds garbage.
 fn modelArch(model: *const Target.Cpu.Model) ?Target.Cpu.Arch {
     const tables = .{
-        .{ Target.Cpu.Arch.aarch64, Target.aarch64.cpu },
-        .{ Target.Cpu.Arch.x86_64, Target.x86.cpu },
+        .{ Target.Cpu.Arch.aarch64, aarch64.cpu },
+        .{ Target.Cpu.Arch.x86_64, x86.cpu },
     };
     inline for (tables) |t| {
         const arch = t[0];
@@ -130,14 +130,14 @@ fn modelArch(model: *const Target.Cpu.Model) ?Target.Cpu.Arch {
 pub const TargetSpec = struct {
     model: Target.Query.CpuModel,
     /// A nonempty match replaces inference. It must include every required ISA condition.
-    match: []const pack.Match = &.{},
+    match: []const Match = &.{},
     /// These conditions supplement inference or the explicit match.
     /// Use this field for a MIDR tiebreak without removal of the ISA checks.
-    extra_match: []const pack.Match = &.{},
+    extra_match: []const Match = &.{},
 };
 
-fn targetMatches(arena: Allocator, target: Target, spec: TargetSpec) []const pack.Match {
-    var matches: std.ArrayList(pack.Match) = .empty;
+fn targetMatches(arena: Allocator, target: Target, spec: TargetSpec) []const Match {
+    var matches: std.ArrayList(Match) = .empty;
     const required = if (spec.match.len > 0) spec.match else inferMatches(arena, target);
     // Runtime match expressions can refer to stack temporaries. The graph owns the copies.
     matches.appendSlice(arena, required) catch @panic("OOM");
@@ -388,7 +388,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
 const ResolvedTarget = struct {
     name: []const u8,
     resolved: Build.ResolvedTarget,
-    match: []const pack.Match,
+    match: []const Match,
     fallback: bool,
 };
 
@@ -402,13 +402,13 @@ test "extra_match retains inferred ISA checks and owns caller conditions" {
         .cpu_model = .{ .explicit = &aarch64.cpu.neoverse_v3 },
     });
     const inferred = inferMatches(arena, target);
-    var extra = [_]pack.Match{midrPart(0x41, 0xd84)};
+    var extra = [_]Match{midrPart(0x41, 0xd84)};
     const matches = targetMatches(arena, target, .{
         .model = .{ .explicit = &aarch64.cpu.neoverse_v3 },
         .extra_match = &extra,
     });
     try testing.expectEqual(inferred.len + 1, matches.len);
-    try testing.expectEqualSlices(pack.Match, inferred, matches[0..inferred.len]);
+    try testing.expectEqualSlices(Match, inferred, matches[0..inferred.len]);
     var found_sve = false;
     var found_sve2 = false;
     for (matches) |m| {
@@ -426,7 +426,7 @@ test "explicit match still overrides inference and accepts extra conditions" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const target = try resolveTargetQuery(testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux });
-    var explicit = [_]pack.Match{.{ .bit = .sve }};
+    var explicit = [_]Match{.{ .bit = .sve }};
     const matches = targetMatches(arena, target, .{
         .model = .baseline,
         .match = &explicit,
@@ -434,7 +434,7 @@ test "explicit match still overrides inference and accepts extra conditions" {
     });
     try testing.expectEqual(@as(u32, 2), matches.len);
     explicit[0] = .{ .bit = .sve2 };
-    try testing.expectEqual(pack.Match{ .bit = .sve }, matches[0]);
+    try testing.expectEqual(Match{ .bit = .sve }, matches[0]);
     try testing.expectEqual(midrPart(0x41, 0xd84), matches[1]);
 }
 

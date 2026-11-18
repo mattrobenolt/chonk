@@ -144,8 +144,7 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
                     return @tagName(e.bit);
                 }
             }
-            return std.fmt.allocPrint(
-                arena,
+            return arena.print(
                 "({s} & 0x{x}) == 0x{x}",
                 .{ @tagName(condition.source), condition.mask, condition.expected },
             ) catch "oom";
@@ -171,15 +170,13 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
                 3 => "edx",
                 else => "?",
             };
-            return std.fmt.allocPrint(
-                arena,
+            return arena.print(
                 "cpuid({x}:{x}).{s}[{d}]",
                 .{ leaf, subleaf, reg_name, bit },
             ) catch "oom";
         },
         .xcr0 => {
-            return std.fmt.allocPrint(
-                arena,
+            return arena.print(
                 "(xcr0 & 0x{x}) == 0x{x} (requires XSAVE/OSXSAVE)",
                 .{ condition.mask, condition.expected },
             ) catch "oom";
@@ -190,14 +187,12 @@ fn describeCondition(arena: Allocator, condition: format.Condition) []const u8 {
             if (condition.mask == 0xFF0F_FFF0) {
                 const implementer: u64 = (condition.expected >> 24) & 0xFF;
                 const part: u64 = (condition.expected >> 4) & 0xFFF;
-                return std.fmt.allocPrint(
-                    arena,
+                return arena.print(
                     "midr part 0x{x} (implementer 0x{x})",
                     .{ part, implementer },
                 ) catch "oom";
             }
-            return std.fmt.allocPrint(
-                arena,
+            return arena.print(
                 "(midr & 0x{x}) == 0x{x}",
                 .{ condition.mask, condition.expected },
             ) catch "oom";
