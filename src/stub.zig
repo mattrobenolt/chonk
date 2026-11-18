@@ -1,21 +1,37 @@
 //! Freestanding dispatcher (direction.md §7 step 4): the naked `_start`
 //! walks the initial stack, finds its own file via AT_EXECFN, reads the
-//! trailer from EOF, streams the payload into a memfd, and execveat's into
-//! it — passing the ORIGINAL argv/envp through untouched. No libc, no CRT;
-//! the only kernel calls are raw syscalls.
+//! trailer from EOF, and dispatches to the winning variant. No libc, no
+//! CRT; the only kernel calls are raw syscalls.
 //!
-//! Dispatch semantics: first variant in table order whose conditions all
-//! pass wins (an is_default entry, or one with no conditions, matches
-//! unconditionally); conditions AND — aarch64 against AT_HWCAP/AT_HWCAP2,
-//! x86_64 against CPUID and the OS state in XCR0.
+//! Two modes, compiled as separate artifacts (chonk's build sets the
+//! `files` option):
+//!  - embedded: stream the payload out of this file into a memfd and
+//!    `execveat` it (`AT_EMPTY_PATH`). One self-contained binary.
+//!  - files: the payloads are separate files beside the shim, named
+//!    `<shim>.d/<variant>`; a plain `execve` of a real path, which path-based
+//!    LSM profiles (AppArmor) can mediate. The memfd is never created.
+//!
+//! Dispatch semantics are identical in both modes: first variant in table
+//! order whose conditions all pass wins (an is_default entry, or one with
+//! no conditions, matches unconditionally); conditions AND — aarch64
+//! against AT_HWCAP/AT_HWCAP2, x86_64 against CPUID and the OS state in
+//! XCR0.
 
 const std = @import("std");
 const linux = std.os.linux;
 const elf = std.elf;
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const format = @import("format.zig");
 const x86 = @import("x86.zig");
+
+/// The trailer mode this artifact understands. A comptime constant, so the
+/// other mode's exec path is not even analyzed into the binary.
+const my_mode: format.Mode = if (build_options.files) .files else .embedded;
+
+/// Linux PATH_MAX. A longer path cannot be resolved by the kernel anyway.
+const path_max = 4096;
 
 /// The auxv record types this stub reads. `std.elf.AT` is keyed by OS, and a
 /// freestanding target falls to the set that stops at NOTELF, so the Linux
@@ -145,6 +161,10 @@ fn dispatch(
     if (footer.magic != format.magic) fatal("bad footer magic — not a chonk binary");
     if (footer.format_version != format.format_version) fatal("unsupported trailer format version");
     if (footer.machine != my_machine) fatal("trailer is for a different machine");
+    if (footer.mode != my_mode) fatal(switch (my_mode) {
+        .embedded => "file-mode trailer — this is the embedded stub (use stub-*-files)",
+        .files => "embedded fat binary — this is the file-mode stub (pack --files)",
+    });
 
     // Entry table: variant_count entries at table_offset. The trailer is
     // untrusted — widen the u32 count before any arithmetic.
@@ -169,7 +189,11 @@ fn dispatch(
         if (entry.is_default != 0 or entry.condition_count == 0 or
             matches(fat_fd, footer.table_offset, entry, hwcap, hwcap2))
         {
-            execVariant(fat_fd, footer.table_offset, entry, argv, envp);
+            if (my_mode == .files) {
+                execFile(fat_fd, footer.table_offset, entry, path, argv, envp);
+            } else {
+                execVariant(fat_fd, footer.table_offset, entry, argv, envp);
+            }
         }
     }
     fatal("no variant matched — malformed trailer (no default?)");
@@ -246,7 +270,9 @@ fn matches(
     return true;
 }
 
-/// Stream `entry`'s payload into a fresh memfd and become it.
+/// Stream `entry`'s payload into a fresh memfd and become it (embedded
+/// mode). sendfile does the copying in the kernel — no userspace buffer, no
+/// whole-file residency.
 fn execVariant(
     fat_fd: linux.fd_t,
     table_offset: u64,
@@ -259,8 +285,6 @@ fn execVariant(
         entry.payload_size > table_offset - entry.payload_offset)
         fatal("payload out of range");
 
-    // Stream the payload into a fresh memfd. sendfile does the copying in
-    // the kernel — no userspace buffer, no whole-file residency.
     const name: [*:0]const u8 = "chonk-payload";
     const mem_rc = linux.memfd_create(name, linux.MFD.CLOEXEC);
     if (linux.errno(mem_rc) != .SUCCESS) fatalSyscall("memfd_create", mem_rc);
@@ -289,6 +313,96 @@ fn execVariant(
     fatalSyscall("execveat", exec_rc);
 }
 
+/// File mode: build `<shim>.d/<name>` beside this executable and exec it.
+/// A plain execve of a real path — no memfd, no execveat — so path-based
+/// LSM profiles (AppArmor) can mediate the transition and name the payload
+/// in their rules.
+fn execFile(
+    fat_fd: linux.fd_t,
+    table_offset: u64,
+    entry: format.VariantEntry,
+    execfn: [*:0]const u8,
+    argv: [*]const ?[*:0]const u8,
+    envp: [*]const ?[*:0]const u8,
+) noreturn {
+    @setRuntimeSafety(false);
+
+    // Name blob: untrusted like the rest of the trailer.
+    if (entry.name_len == 0) fatal("variant has no name — repack in file mode");
+    if (entry.name_len > format.max_name_len) fatal("variant name too long");
+    if (@as(u64, entry.name_offset) + entry.name_len > table_offset)
+        fatal("variant name out of range");
+
+    var name: [format.max_name_len]u8 = undefined;
+    preadFull(fat_fd, name[0..entry.name_len], @intCast(entry.name_offset));
+
+    // The packer enforces this; the reader enforces it too, so a hand-built
+    // shim cannot turn a name into a path traversal.
+    for (name[0..entry.name_len]) |c| {
+        if (c == '/' or c == 0) fatal("variant name is not a path component");
+    }
+
+    // Locate ourselves. /proc/self/exe follows symlinks, which matters when
+    // PATH resolves through one; AT_EXECFN is the fallback when /proc is
+    // not mounted.
+    var self_buf: [path_max]u8 = undefined;
+    const self_path = selfPath(execfn, &self_buf);
+
+    var payload_path: [path_max]u8 = undefined;
+    const len = payloadPath(self_path, name[0..entry.name_len], &payload_path) orelse
+        fatal("payload path exceeds PATH_MAX");
+
+    // argv/envp pass through exactly as the kernel handed them to us, so
+    // the payload sees the same command line it would in embedded mode.
+    const exec_rc = linux.execve(
+        payload_path[0..len :0].ptr,
+        @ptrCast(argv),
+        @ptrCast(envp),
+    );
+    fatalExecPath(exec_rc, payload_path[0..len]);
+}
+
+/// The path the kernel executed: /proc/self/exe first (it resolves
+/// symlinks), AT_EXECFN as the no-/proc fallback.
+fn selfPath(execfn: [*:0]const u8, buf: *[path_max]u8) []const u8 {
+    const rc = linux.readlinkat(linux.AT.FDCWD, "/proc/self/exe", buf, buf.len);
+    if (linux.errno(rc) == .SUCCESS and rc > 0 and rc < buf.len) {
+        return buf[0..rc];
+    }
+    return std.mem.span(execfn);
+}
+
+/// `<dirname(self)>/<basename(self)>.d/<name>`, NUL-terminated. Returns the
+/// length without the terminator, or null when the result does not fit.
+///
+/// The directory derives from the resolved self path, so a symlinked entry
+/// point finds the payloads beside the real file and a renamed shim looks
+/// in its own renamed directory.
+fn payloadPath(self_path: []const u8, name: []const u8, out: *[path_max]u8) ?usize {
+    @setRuntimeSafety(false);
+
+    // Everything through the last '/', including it — or nothing at all
+    // when the exec path was a bare name.
+    var prefix: usize = 0;
+    for (self_path, 0..) |c, i| {
+        if (c == '/') prefix = i + 1;
+    }
+    const base = self_path[prefix..];
+    const total = prefix + base.len + ".d/".len + name.len;
+    if (total + 1 > out.len) return null;
+
+    @memcpy(out[0..prefix], self_path[0..prefix]);
+    var cursor = prefix;
+    @memcpy(out[cursor..][0..base.len], base);
+    cursor += base.len;
+    @memcpy(out[cursor..][0..".d/".len], ".d/");
+    cursor += ".d/".len;
+    @memcpy(out[cursor..][0..name.len], name);
+    cursor += name.len;
+    out[cursor] = 0;
+    return cursor;
+}
+
 /// Read exactly `buf.len` bytes at `offset` from `fd`. Any shortfall is
 /// fatal — the trailer is trusted with nothing.
 fn preadFull(fd: linux.fd_t, buf: []u8, offset: i64) void {
@@ -302,13 +416,30 @@ fn preadFull(fd: linux.fd_t, buf: []u8, offset: i64) void {
     }
 }
 
-/// Report to stderr and die — the only exit that is not execveat.
+/// Report to stderr and die — dispatch either execs or ends here.
 fn fatal(comptime what: []const u8) noreturn {
     @branchHint(.cold);
     var stderr_buffer: [128]u8 = undefined;
     var w: Writer = .init(linux.STDERR_FILENO, &stderr_buffer);
     w.append("chonk: ");
     w.append(what);
+    w.append("\n");
+    _ = linux.write(w.fd, w.slice().ptr, w.slice().len);
+    linux.exit_group(1);
+}
+
+/// execve's errno plus the path it tried: the diagnostic a denied profile
+/// or a missing payload directory needs.
+fn fatalExecPath(rc: usize, path: []const u8) noreturn {
+    @branchHint(.cold);
+    var stderr_buffer: [256]u8 = undefined;
+    var w: Writer = .init(linux.STDERR_FILENO, &stderr_buffer);
+    w.append("chonk: execve payload: E");
+    w.append(@tagName(linux.errno(rc)));
+    w.append("\n    ");
+    // Fixed buffer: clip an unusually long path rather than overflow.
+    const room = w.remaining().len - 1; // leave the newline a slot
+    w.append(path[0..@min(path.len, room)]);
     w.append("\n");
     _ = linux.write(w.fd, w.slice().ptr, w.slice().len);
     linux.exit_group(1);

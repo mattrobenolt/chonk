@@ -125,6 +125,85 @@ else
     skip "pack-cli (aarch64 CLI door; needs an aarch64 host)"
 fi
 
+# --- file mode: CLI door ------------------------------------------------------
+# Same variant table, but the payloads are real files in <shim>.d/ and
+# dispatch is a plain execve of a path — the AppArmor-compatible shape. The
+# trace assertions are the point: the file-mode shim has no memfd_create and
+# no execveat, while the embedded one has both.
+
+if [ "$arch" = aarch64 ]; then
+    run ./zig-out/bin/chonk pack --files zig-out/bin/stub-aarch64-files \
+        tests/e2e/pack-cli.zon .zig-cache/e2e/pack-cli-files
+    expect_out "linked: 3 variants" "file-mode pack"
+    expect_rc 0 "file-mode pack rc"
+
+    for name in v2 v1 bash; do
+        if [ -x ".zig-cache/e2e/pack-cli-files.d/$name" ]; then
+            ok "file-mode payload $name"
+        else
+            fail "file-mode payload $name missing"
+        fi
+    done
+
+    run ./zig-out/bin/chonk inspect .zig-cache/e2e/pack-cli-files
+    expect_out "chonk file-mode shim" "file-mode inspect mode"
+    expect_out "0: v2 (" "file-mode inspect names"
+    expect_out "2: bash (.*fallback" "file-mode inspect fallback"
+    expect_rc 0 "file-mode inspect rc"
+
+    # Native dispatch: whichever tier the host advertises — tolerant because
+    # hosts differ (v2 is the chonk tracer, rc 2; v1/fallback are bash).
+    run .zig-cache/e2e/pack-cli-files -c 'echo FILE-native'
+    case "$out" in
+        *"usage: chonk"* | *"FILE-native"*) ok "file-mode native dispatch (rc=$rc)" ;;
+        *) fail "file-mode native dispatch (unexpected output)" ;;
+    esac
+    expect_rc_any "0 2" "file-mode native dispatch rc"
+
+    # A symlinked entry point must still find the payloads beside the real
+    # file: PATH entries are symlinks on NixOS, so this is the deployment
+    # shape, not an edge case.
+    ln -sf pack-cli-files .zig-cache/e2e/file-link
+    run .zig-cache/e2e/file-link
+    case "$out" in
+        *"execve payload"*) fail "file-mode symlinked entry (payload lookup failed)" ;;
+        *) ok "file-mode symlinked entry resolves the real directory" ;;
+    esac
+
+    # Controlled CPU identities, same matrix as the fat binary.
+    run qemu-aarch64 -cpu max .zig-cache/e2e/pack-cli-files
+    expect_out "usage: chonk" "file-mode qemu max (v2 tier: chonk tracer)"
+    expect_rc 2 "file-mode qemu max rc"
+
+    run qemu-aarch64 -cpu neoverse-v1 .zig-cache/e2e/pack-cli-files -c 'echo FILE-v1-bash'
+    expect_out "FILE-v1-bash" "file-mode qemu neoverse-v1 (sve tier: bash)"
+    expect_rc 0 "file-mode qemu neoverse-v1 rc"
+
+    run qemu-aarch64 -cpu cortex-a72 .zig-cache/e2e/pack-cli-files -c 'echo FILE-fallback-bash'
+    expect_out "FILE-fallback-bash" "file-mode qemu cortex-a72 (fallback: bash)"
+    expect_rc 0 "file-mode qemu cortex-a72 rc"
+
+    # The syscall shape, which is the whole reason this mode exists.
+    t_files=$(timeout 60 qemu-aarch64 -strace .zig-cache/e2e/pack-cli-files 2>&1 || true)
+    if grep -q "execve(" <<<"$t_files" &&
+        ! grep -q "memfd_create" <<<"$t_files" &&
+        ! grep -q "execveat" <<<"$t_files"; then
+        ok "file-mode trace (execve of a path; no memfd_create/execveat)"
+    else
+        out=$t_files
+        fail "file-mode trace (wanted execve and no memfd_create/execveat)"
+    fi
+    t_fat=$(timeout 60 qemu-aarch64 -strace .zig-cache/e2e/pack-cli-fat 2>&1 || true)
+    if grep -q "memfd_create" <<<"$t_fat" && grep -q "execveat" <<<"$t_fat"; then
+        ok "embedded trace (memfd_create + execveat, the contrast)"
+    else
+        out=$t_fat
+        fail "embedded trace (wanted memfd_create + execveat)"
+    fi
+else
+    skip "file mode CLI door (aarch64; the x86 job covers its own)"
+fi
+
 # --- consumer example --------------------------------------------------------
 # The build-system door: normal build, run step, the two-species release
 # fleet, native dispatch, inspect both species. zig cross-builds, so this
@@ -137,6 +216,7 @@ zig build
 }
 zig build run | grep -q "app built for CPU model" || { fail "consumer run step"; }
 zig build chonk
+zig build files
 popd >/dev/null
 
 # Native dispatch of the aarch64 fleet fat — aarch64 hosts only (the
@@ -155,6 +235,37 @@ run ./zig-out/bin/chonk inspect examples/consumer/zig-out/bin/app
 expect_out "machine aarch64, 5 variants" "consumer inspect (aarch64 fleet)"
 run ./zig-out/bin/chonk inspect examples/consumer/zig-out/bin/app-x86_64
 expect_out "machine x86_64, 2 variants" "consumer inspect (x86_64 fleet)"
+
+# The files-mode fleet from the build door: shim at bin/app-files, payloads
+# at bin/app-files.d/<cpu model>. The names come from the resolved models,
+# and the fallback is the arch baseline (zig calls it "generic").
+if [ -x examples/consumer/zig-out/bin/app-files ] &&
+    [ -x examples/consumer/zig-out/bin/app-files.d/neoverse_v2 ] &&
+    [ -x examples/consumer/zig-out/bin/app-files.d/generic ]; then
+    ok "consumer files fleet layout"
+else
+    fail "consumer files fleet layout (shim or payloads missing)"
+fi
+run ./zig-out/bin/chonk inspect examples/consumer/zig-out/bin/app-files
+expect_out "chonk file-mode shim" "consumer files inspect mode"
+expect_out "machine aarch64, 5 variants" "consumer files inspect variants"
+expect_rc 0 "consumer files inspect rc"
+
+if [ "$arch" = aarch64 ]; then
+    run ./examples/consumer/zig-out/bin/app-files
+    expect_out "app built for CPU model: neoverse" "consumer files native dispatch"
+    expect_rc 0 "consumer files native rc"
+
+    run qemu-aarch64 -cpu max,sve=off,midr=0x410fd841 ./examples/consumer/zig-out/bin/app-files
+    expect_out "app built for CPU model: neoverse_n1" "consumer files qemu n1 (V3 MIDR without SVE)"
+    expect_rc 0 "consumer files qemu n1 rc"
+
+    run qemu-aarch64 -cpu cortex-a72 ./examples/consumer/zig-out/bin/app-files
+    expect_out "app built for CPU model: generic" "consumer files qemu a72 (baseline)"
+    expect_rc 0 "consumer files qemu a72 rc"
+else
+    skip "consumer files native dispatch (aarch64 fleet, needs an aarch64 host)"
+fi
 
 # --- tier matrix: tiers.zon ---------------------------------------------------
 # Controlled CPU identities: qemu max (sve2), neoverse-v1 (sve, no sve2),
@@ -274,6 +385,14 @@ if [ "$arch" = x86_64 ]; then
     run .zig-cache/e2e/pack-cli-x86-fat -c 'echo TIER-avx2'
     expect_out "TIER-avx2" "pack-cli-x86 native dispatch (avx2 tier)"
     expect_rc 0 "pack-cli-x86 native dispatch"
+
+    run ./zig-out/bin/chonk pack --files zig-out/bin/stub-x86_64-files \
+        tests/e2e/pack-cli-x86.zon .zig-cache/e2e/pack-cli-x86-files
+    expect_out "linked: 2 variants" "file-mode-x86 pack"
+    expect_rc 0 "file-mode-x86 pack rc"
+    run .zig-cache/e2e/pack-cli-x86-files -c 'echo TIER-avx2-files'
+    expect_out "TIER-avx2-files" "file-mode-x86 native dispatch (avx2 tier)"
+    expect_rc 0 "file-mode-x86 native dispatch"
 else
     skip "pack-cli-x86 (needs an x86_64 host; the CI x86 job covers it)"
 fi
@@ -303,6 +422,34 @@ esac
 run "./zig-out/bin/$HOST_STUB"
 expect_out "bad footer magic" "errors: bare stub (bad footer magic)"
 expect_rc 1 "errors: bare stub rc"
+
+run "./zig-out/bin/$HOST_STUB-files"
+expect_out "bad footer magic" "errors: bare file-mode stub (bad footer magic)"
+expect_rc 1 "errors: bare file-mode stub rc"
+
+# Trailer mode is part of the contract. Packing with the wrong stub makes a
+# file whose code and trailer disagree — the stub catches it at run time,
+# which is the only place it can (the two stubs share an ELF machine).
+run ./zig-out/bin/chonk pack "./zig-out/bin/$HOST_STUB-files" \
+    tests/e2e/pack-cli.zon .zig-cache/e2e/mode-mismatch-embedded
+run .zig-cache/e2e/mode-mismatch-embedded
+expect_out "embedded fat binary" "errors: file-mode stub on an embedded fat binary"
+expect_rc 1 "errors: file-mode stub on an embedded fat binary rc"
+
+run ./zig-out/bin/chonk pack --files "./zig-out/bin/$HOST_STUB" \
+    tests/e2e/pack-cli.zon .zig-cache/e2e/mode-mismatch-files
+run .zig-cache/e2e/mode-mismatch-files
+expect_out "file-mode trailer" "errors: embedded stub on a file-mode shim"
+expect_rc 1 "errors: embedded stub on a file-mode shim rc"
+
+# A shim copied away from its payload directory names the path it tried.
+run ./zig-out/bin/chonk pack --files "./zig-out/bin/$HOST_STUB-files" \
+    tests/e2e/pack-cli.zon .zig-cache/e2e/lonely-shim
+cp -f .zig-cache/e2e/lonely-shim .zig-cache/e2e/lonely-shim-moved
+run .zig-cache/e2e/lonely-shim-moved
+expect_out "execve payload: ENOENT" "errors: file-mode missing payload dir"
+expect_out "lonely-shim-moved.d" "errors: missing payload dir names the path"
+expect_rc 1 "errors: file-mode missing payload dir rc"
 
 run ./zig-out/bin/chonk inspect tests/e2e/bash
 expect_out "not a chonk binary" "errors: inspect non-chonk"

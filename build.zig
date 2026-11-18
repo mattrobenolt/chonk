@@ -10,7 +10,10 @@ const api = @import("src/build.zig");
 
 // The consumer surface: `chonk.addExecutable(...)` and friends.
 pub const addExecutable = api.addExecutable;
+pub const addFilesExecutable = api.addFilesExecutable;
 pub const ExecutableOptions = api.ExecutableOptions;
+pub const FilesExecutable = api.FilesExecutable;
+pub const Payload = api.Payload;
 pub const TargetSpec = api.TargetSpec;
 pub const Variant = api.Variant;
 pub const ExeFactory = api.ExeFactory;
@@ -38,31 +41,44 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(exe);
 
-    // The freestanding dispatchers, one per species (#3): no libc — raw
-    // syscalls only, custom naked `_start` entry (src/stub.zig). Freestanding
-    // target is what keeps std.start out: on linux targets the compiler
-    // force-analyzes std.zig, which force-analyzes std.start, which demands a
-    // `main` and fights over the `_start` symbol. Freestanding skips all of
-    // that; std.os.linux wrappers still compile (arch-gated, not os-gated).
-    // Always ReleaseSmall + stripped — compiled-once-forever artifacts (~3
-    // pages), for the CLI pack path. The build API compiles its own per
-    // species at addExecutable time.
-    inline for ([_]struct { []const u8, std.Target.Cpu.Arch }{
-        .{ "stub-aarch64", .aarch64 },
-        .{ "stub-x86_64", .x86_64 },
+    // The freestanding dispatchers, per species and per trailer mode (#3):
+    // no libc — raw syscalls only, custom naked `_start` entry
+    // (src/stub.zig). The `-files` pair carries the file-mode exec path
+    // (payload files beside the shim, plain execve); the plain pair carries
+    // the embedded path (memfd + execveat). Building them separately keeps
+    // each path out of the other binary.
+    //
+    // Freestanding target is what keeps std.start out: on linux targets the
+    // compiler force-analyzes std.zig, which force-analyzes std.start, which
+    // demands a `main` and fights over the `_start` symbol. Freestanding
+    // skips all of that; std.os.linux wrappers still compile (arch-gated,
+    // not os-gated). Always ReleaseSmall + stripped — compiled-once-forever
+    // artifacts (~3 pages), for the CLI pack path. The build API compiles
+    // its own per species at addExecutable time.
+    inline for ([_]struct { name: []const u8, arch: std.Target.Cpu.Arch, files: bool }{
+        .{ .name = "stub-aarch64", .arch = .aarch64, .files = false },
+        .{ .name = "stub-aarch64-files", .arch = .aarch64, .files = true },
+        .{ .name = "stub-x86_64", .arch = .x86_64, .files = false },
+        .{ .name = "stub-x86_64-files", .arch = .x86_64, .files = true },
     }) |stub_spec| {
-        const stub = b.addExecutable(.{
-            .name = stub_spec[0],
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/stub.zig"),
-                .target = b.resolveTargetQuery(.{
-                    .cpu_arch = stub_spec[1],
-                    .os_tag = .freestanding,
-                }),
-                .optimize = .small,
-                .strip = true,
-                .single_threaded = true,
+        const options = b.addOptions();
+        options.addOption(bool, "files", stub_spec.files);
+
+        const stub_mod = b.createModule(.{
+            .root_source_file = b.path("src/stub.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = stub_spec.arch,
+                .os_tag = .freestanding,
             }),
+            .optimize = .small,
+            .strip = true,
+            .single_threaded = true,
+        });
+        stub_mod.addOptions("build_options", options);
+
+        const stub = b.addExecutable(.{
+            .name = stub_spec.name,
+            .root_module = stub_mod,
         });
 
         stub.entry = .enabled;

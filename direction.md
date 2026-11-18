@@ -364,3 +364,53 @@ If XSAVE or OSXSAVE is absent, the condition fails.
 Inferred AVX targets require XCR0 bits 1 and 2 (`0x6`). Inferred AVX-512
 targets also require bits 5, 6, and 7 (`0xe6`). Both format versions reject
 the other version. The CLI requires the current stub for new packs.
+
+## File mode: payloads on disk (2026-11-18)
+
+Embedded dispatch ends in `execveat(memfd, AT_EMPTY_PATH)`. AppArmor has no
+path to attach to that exec: a profile sees the anonymous file as `/` or a
+disconnected `memfd:` name, so the only rule that admits the payload is
+`/ ix` — execute anything. That is a sandbox escape dressed as a rule, and
+it is the reason file mode exists.
+
+File mode is the same stub, compiled as a second artifact per arch, with a
+different last step: build `<shim>.d/<variant>` beside the resolved self
+path and `execve` it. The variant table, condition evaluation, and
+first-match order are unchanged, so the wire format stays one format:
+
+- `Footer.mode` (`embedded` = 0, `files` = 1) replaces a padding byte.
+  The stub is compiled per mode and refuses the other mode's trailer.
+- `VariantEntry` gains `name_offset`/`name_len` (a name blob before the
+  entry table). The fields fit the existing 32 bytes, so the entry size did
+  not change; `is_default` moved to offset 30. `format_version` is 3.
+- Names were display-only metadata in v2. In file mode they are file names,
+  so the packer constrains them to single safe path components, capped at
+  255 bytes, and rejects duplicates. Embedded mode keeps arbitrary display
+  names.
+
+Self-location uses `readlinkat("/proc/self/exe")` first, because it resolves
+symlinks (a NixOS PATH entry is a symlink into the store), with `AT_EXECFN`
+as the fallback when `/proc` is not mounted. The payload directory name
+derives from the resolved basename, so a shim installed as `app-x86_64`
+looks in `app-x86_64.d`.
+
+Rejected alternatives:
+
+- A sidecar manifest. It is a second file that can drift from the shim and
+  forces a parser into the freestanding stub. The table lives in the shim.
+- In-process loading (UPX-style: map the payload's `PT_LOAD` segments, fix
+  up the auxv, jump). The mechanics are real for static-PIE payloads, but
+  it sidesteps AppArmor instead of satisfying it — no exec transition, no
+  audit event, everything attributed to the shim's domain. It also requires
+  relinking the stub and every payload (they are currently `ET_EXEC` at
+  `0x01000000`, overlapping the running stub), reimplements a slice of
+  binfmt_elf plus `PT_INTERP` for dynamic payloads, and is more
+  malware-shaped to a scanner than the memfd exec it replaces.
+- `execveat` on an `O_PATH` fd to a regular payload file. Still the syscall
+  under scrutiny, and the path rules apply anyway; a plain `execve` says
+  what it means.
+
+The file-mode shim's syscalls are `openat`, `lseek`, `pread64`,
+`readlinkat`, and `execve`. `memfd_create`, `sendfile`, and `execveat` are
+absent from the binary because the comptime mode selects the other exec
+path out at analysis time.

@@ -7,8 +7,13 @@
 //! Output layout:
 //!
 //!   [ stub ][ pad→page ][ payload_0 ][ pad ][ payload_1 ] ...
-//!   [ Condition blob ][ VariantEntry[0..N] ][ Footer ]
-//!                                           ↑ table_offset  ↑ EOF
+//!   [ Condition blob ][ Name blob ][ VariantEntry[0..N] ][ Footer ]
+//!                                                          ↑ table_offset
+//!
+//! File mode writes the same records with no payload bytes: the shim
+//! carries the variant table and the payloads are separate files beside it
+//! (`<shim>.d/<variant name>`), so dispatch can be a plain `execve` of a
+//! path instead of a memfd + `execveat`.
 //!
 //! The packer is arch-blind: it stamps the footer's `machine` from the
 //! stub's own ELF header and refuses payloads whose machines disagree.
@@ -35,6 +40,10 @@ const max_file_size: u64 = 1 << 30;
 // ---------------------------------------------------------------------------
 // Config schema — what chonk.zon parses into.
 // ---------------------------------------------------------------------------
+
+/// Where the payloads live: embedded in the output or beside it. Re-exported
+/// for the build API, which picks the stub artifact by mode.
+pub const Mode = format.Mode;
 
 /// The parsed config file.
 pub const Config = struct {
@@ -317,12 +326,15 @@ pub fn midrPart(implementer: u8, part: u12) Match {
 // run — the `chonk pack <stub> <config.zon> <output>` subcommand.
 // ---------------------------------------------------------------------------
 
-const pack_usage = "usage: chonk pack <stub> <config.zon> <output>\n";
+const pack_usage = "usage: chonk pack [--files] [--no-copy] <stub> <config.zon> <output>\n";
 
 const pack_help = pack_usage ++
     \\  stub        chonk stub for the target architecture
     \\  config.zon  variant and payload config
-    \\  output      path for the fat binary
+    \\  output      path for the fat binary; with --files, the shim
+    \\  --files     write a file-mode shim: the payloads stay separate files
+    \\              and resolve beside the shim as <output>.d/<variant name>
+    \\  --no-copy   with --files: write only the shim, not the payload copies
     \\
 ;
 
@@ -330,12 +342,14 @@ const Paths = struct {
     stub: []const u8,
     config: []const u8,
     out: []const u8,
+    mode: Mode = .embedded,
+    copy_payloads: bool = true,
 };
 
-/// `chonk pack <stub> <config.zon> <output>` — the human door. The build
-/// system calls `packAll` in-process as a module instead. args is the cursor
-/// positioned after the subcommand word; stdio is initialized by the front
-/// door.
+/// `chonk pack [--files] <stub> <config.zon> <output>` — the human door. The
+/// build system calls `packAll` in-process as a module instead. args is the
+/// cursor positioned after the subcommand word; stdio is initialized by the
+/// front door.
 pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
     const cwd = Io.Dir.cwd();
 
@@ -364,14 +378,27 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
     else
         cwd;
 
-    return packAll(io, arena, cwd, config_dir, paths.out, paths.stub, config);
+    return packAll(
+        io,
+        arena,
+        cwd,
+        config_dir,
+        paths.out,
+        paths.stub,
+        config,
+        paths.mode,
+        paths.copy_payloads,
+    );
 }
 
-/// Read the three fixed positionals. `-h`/`--help` prints and returns null;
-/// every other error prints the usage and fails with `error.Usage`.
+/// Read the three fixed positionals and the switches. `-h`/`--help` prints
+/// and returns null; every other error prints the usage and fails with
+/// `error.Usage`.
 fn parsePaths(args: *cli.Args) !?Paths {
     var paths: [3][]const u8 = undefined;
     var count: usize = 0;
+    var mode: Mode = .embedded;
+    var copy_payloads = true;
 
     while (args.next()) |tok| switch (tok) {
         .positional => |path| {
@@ -388,21 +415,40 @@ fn parsePaths(args: *cli.Args) !?Paths {
                 stdout.writeAll(pack_help);
                 return null;
             }
+            if (opt.isSwitch("files", null)) {
+                mode = .files;
+                continue;
+            }
+            if (opt.isSwitch("no-copy", null)) {
+                copy_payloads = false;
+                continue;
+            }
             stderr.print("chonk: unknown option '{f}'\n", .{opt});
             stderr.writeAll(pack_usage);
             return error.Usage;
         },
     };
 
+    if (mode == .embedded and !copy_payloads) {
+        stderr.writeAll("chonk: --no-copy applies only to --files\n");
+        stderr.writeAll(pack_usage);
+        return error.Usage;
+    }
     if (count != paths.len) {
         stderr.writeAll(pack_usage);
         return error.Usage;
     }
-    return .{ .stub = paths[0], .config = paths[1], .out = paths[2] };
+    return .{
+        .stub = paths[0],
+        .config = paths[1],
+        .out = paths[2],
+        .mode = mode,
+        .copy_payloads = copy_payloads,
+    };
 }
 
 /// The shared tail of both pack forms: read + check the stub, validate the
-/// config, load + compile variants, write the fat binary, report.
+/// config, load + compile variants, write the output, report.
 pub fn packAll(
     io: Io,
     arena: Allocator,
@@ -411,39 +457,78 @@ pub fn packAll(
     out_path: []const u8,
     stub_path: []const u8,
     config: Config,
+    mode: Mode,
+    copy_payloads: bool,
 ) !u8 {
     const stub = try readFile(io, arena, cwd, stub_path);
     const stub_machine = (try elfCheck(stub_path, stub)).machine;
 
     try validateConfig(config);
     const named = try normalizeConfig(arena, config);
+    try validateNames(named, mode);
     const loaded = try loadVariants(io, arena, config_dir, named, stub_machine);
 
-    const lay = try writeFat(io, arena, cwd, config_dir, out_path, stub, stub_machine, loaded);
+    const lay = try writeOutput(
+        io,
+        arena,
+        cwd,
+        config_dir,
+        out_path,
+        stub,
+        stub_machine,
+        mode,
+        loaded,
+        copy_payloads,
+    );
 
-    var unique_count: usize = 0;
-    for (loaded) |v| unique_count = @max(unique_count, v.payload_index + 1);
-    stdout.print("packed: {d} variants ({d} unique payload(s)), total {d}\n", .{
-        loaded.len, unique_count, lay.size,
-    });
+    if (mode == .files) {
+        stdout.print("linked: {d} variants, shim {d} bytes{s}\n", .{
+            loaded.len,
+            lay.size,
+            if (copy_payloads) " with payloads beside it" else "",
+        });
+    } else {
+        var unique_count: usize = 0;
+        for (loaded) |v| unique_count = @max(unique_count, v.payload_index + 1);
+        stdout.print("packed: {d} variants ({d} unique payload(s)), total {d}\n", .{
+            loaded.len, unique_count, lay.size,
+        });
+    }
     for (loaded, 0..) |v, i| {
-        const offset = lay.payload_offsets[v.payload_index];
-        var shared = false;
-        for (loaded[0..i]) |prev| {
-            if (prev.payload_index == v.payload_index) shared = true;
-        }
         const suffix: []const u8 = if (v.cfg.match.len == 0) ", fallback" else "";
-        stdout.print(
-            "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s}{s})\n",
-            .{
-                v.cfg.name,
-                offset,
-                v.payload.size,
-                v.conditions.len,
-                suffix,
-                if (shared) ", shared" else "",
+        switch (mode) {
+            .embedded => {
+                const offset = lay.payload_offsets[v.payload_index];
+                var shared = false;
+                for (loaded[0..i]) |prev| {
+                    if (prev.payload_index == v.payload_index) shared = true;
+                }
+                stdout.print(
+                    "  {s}: payload @ {d} ({d} byte(s), {d} condition(s){s}{s})\n",
+                    .{
+                        v.cfg.name,
+                        offset,
+                        v.payload.size,
+                        v.conditions.len,
+                        suffix,
+                        if (shared) ", shared" else "",
+                    },
+                );
             },
-        );
+            .files => if (copy_payloads) stdout.print(
+                "  {s}.d/{s}: {d} byte(s), {d} condition(s){s}\n",
+                .{
+                    Io.Dir.path.basename(out_path),
+                    v.cfg.name,
+                    v.payload.size,
+                    v.conditions.len,
+                    suffix,
+                },
+            ) else stdout.print(
+                "  {s}: {d} byte(s), {d} condition(s){s}\n",
+                .{ v.cfg.name, v.payload.size, v.conditions.len, suffix },
+            ),
+        }
     }
     return 0;
 }
@@ -479,7 +564,7 @@ const NamedVariant = struct {
 };
 
 /// Fill optional names with derived ones — the payload basename. Display
-/// only; downstream error messages and reports read better with a name.
+/// only in embedded mode; a file name in file mode.
 fn normalizeConfig(arena: Allocator, config: Config) Allocator.Error![]NamedVariant {
     const variants = try arena.alloc(NamedVariant, config.variants.len);
     for (config.variants, 0..) |v, i| {
@@ -490,6 +575,50 @@ fn normalizeConfig(arena: Allocator, config: Config) Allocator.Error![]NamedVari
         };
     }
     return variants;
+}
+
+/// The shim accepts nothing longer; keep the wire and the stack buffer in
+/// agreement.
+pub const max_name_len = format.max_name_len;
+
+/// Names are display metadata in embedded mode, but in file mode they are
+/// path components the shim appends to `<shim>.d/`. Reject anything that is
+/// not a safe single file name there — a config is not allowed to point
+/// dispatch at an arbitrary path.
+fn validateNames(variants: []const NamedVariant, mode: Mode) !void {
+    for (variants) |v| {
+        if (v.name.len == 0) {
+            return configFail("variant '{s}' has an empty name", .{v.binary});
+        }
+        if (v.name.len > max_name_len) {
+            return configFail("variant name '{s}' exceeds {d} bytes", .{ v.name, max_name_len });
+        }
+        if (mode == .embedded) continue;
+        for (v.name) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-') {
+                return configFail(
+                    "variant name '{s}': in file mode the name is a file name " ++
+                        "— use only letters, digits, '.', '_', '-'",
+                    .{v.name},
+                );
+            }
+        }
+        if (mem.eql(u8, v.name, ".") or mem.eql(u8, v.name, "..")) {
+            return configFail("variant name '{s}' is a path component", .{v.name});
+        }
+    }
+    if (mode == .files) {
+        for (variants, 0..) |a, i| {
+            for (variants[i + 1 ..]) |b| {
+                if (mem.eql(u8, a.name, b.name)) {
+                    return configFail(
+                        "duplicate variant name '{s}': in file mode names are file names",
+                        .{a.name},
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// One validated variant: config + payload bytes + compiled conditions.
@@ -776,14 +905,16 @@ fn logFail(path: []const u8, action: []const u8, err: anyerror) void {
 // Layout + write.
 // ---------------------------------------------------------------------------
 
-/// Fat-binary offsets for N variants. Pure math over lengths — testable
+/// Output offsets for N variants. Pure math over lengths — testable
 /// without touching a file.
 pub const Layout = struct {
-    /// Per-variant absolute page-aligned payload offsets.
+    /// Per-variant absolute page-aligned payload offsets. Empty in file mode.
     payload_offsets: []u64,
     /// Per-variant absolute offsets of the variant's first Condition in
     /// the condition blob.
     condition_offsets: []u32,
+    /// Per-variant absolute offsets of the variant's name in the name blob.
+    name_offsets: []u32,
     /// Absolute offset of `VariantEntry[0]`.
     table_offset: u64,
     /// Total output size.
@@ -795,9 +926,11 @@ pub fn layout(
     stub_len: u64,
     payload_lens: []const u64,
     condition_counts: []const u32,
+    name_lens: []const u32,
 ) Allocator.Error!Layout {
     const payload_offsets = try arena.alloc(u64, payload_lens.len);
     const condition_offsets = try arena.alloc(u32, condition_counts.len);
+    const name_offsets = try arena.alloc(u32, name_lens.len);
 
     var cursor: u64 = stub_len;
     for (payload_lens, 0..) |payload_len, i| {
@@ -806,8 +939,9 @@ pub fn layout(
         cursor += payload_len;
     }
 
-    // Condition blob: right after the last payload. No alignment needed —
-    // the stub reads conditions through the decoder, not mmap.
+    // Condition blob: right after the last payload (or the stub). No
+    // alignment needed — the stub reads conditions through the decoder, not
+    // mmap.
     const blob_start = cursor;
     var running: u64 = 0;
     for (condition_counts, 0..) |count, i| {
@@ -815,6 +949,13 @@ pub fn layout(
         running += @as(u64, count) * @sizeOf(format.Condition);
     }
     cursor += running;
+
+    // Name blob: concatenated variant names, no terminators; each entry
+    // carries its offset and length.
+    for (name_lens, 0..) |name_len, i| {
+        name_offsets[i] = @intCast(cursor);
+        cursor += name_len;
+    }
 
     const table_offset = cursor;
     // NOTE: entries are per-VARIANT (condition_counts.len), not per
@@ -826,14 +967,17 @@ pub fn layout(
     return .{
         .payload_offsets = payload_offsets,
         .condition_offsets = condition_offsets,
+        .name_offsets = name_offsets,
         .table_offset = table_offset,
         .size = cursor,
     };
 }
 
-/// Concatenate and write the fat binary: stub, page-padded payloads,
-/// condition blob, entry table, footer. Output mode 0755.
-fn writeFat(
+/// Write the output: stub, page-padded payloads (embedded mode only),
+/// condition blob, name blob, entry table, footer. Output mode 0755. In
+/// file mode the payloads are separate files beside the output, copied as
+/// `<output>.d/<name>` unless `copy_payloads` is false.
+fn writeOutput(
     io: Io,
     arena: Allocator,
     dir: Io.Dir,
@@ -841,31 +985,46 @@ fn writeFat(
     out_path: []const u8,
     stub: []const u8,
     machine: u16,
+    mode: Mode,
     variants: []const LoadedVariant,
+    copy_payloads: bool,
 ) !Layout {
     // One unique-payload slot per distinct byte set; variants with
-    // identical bytes share a slot and its offset.
+    // identical bytes share a slot and its offset. File mode embeds
+    // nothing, so it has no slots.
     var unique_count: usize = 0;
-    for (variants) |v| unique_count = @max(unique_count, v.payload_index + 1);
+    if (mode == .embedded) {
+        for (variants) |v| unique_count = @max(unique_count, v.payload_index + 1);
+    }
     const unique: []const LoadedVariant = blk: {
         const u = try arena.alloc(LoadedVariant, unique_count);
-        for (variants) |v| u[v.payload_index] = v;
+        if (mode == .embedded) {
+            for (variants) |v| u[v.payload_index] = v;
+        }
         break :blk u;
     };
 
     const payload_lens = try arena.alloc(u64, unique_count);
     const condition_counts = try arena.alloc(u32, variants.len);
+    const name_lens = try arena.alloc(u32, variants.len);
     for (unique, 0..) |v, i| payload_lens[i] = v.payload.size;
-    for (variants, 0..) |v, i| condition_counts[i] = @intCast(v.conditions.len);
-    const lay = try layout(arena, stub.len, payload_lens, condition_counts);
+    for (variants, 0..) |v, i| {
+        condition_counts[i] = @intCast(v.conditions.len);
+        name_lens[i] = @intCast(v.cfg.name.len);
+    }
+    const lay = try layout(arena, stub.len, payload_lens, condition_counts, name_lens);
 
     const entries = try arena.alloc(format.VariantEntry, variants.len);
     for (variants, 0..) |v, i| {
         entries[i] = .{
-            .payload_offset = lay.payload_offsets[v.payload_index],
+            .payload_offset = if (mode == .embedded) lay.payload_offsets[v.payload_index] else 0,
+            // File mode keeps the size for the table (inspect, diagnostics);
+            // the shim reads the file itself and ignores it.
             .payload_size = v.payload.size,
             .condition_offset = lay.condition_offsets[i],
             .condition_count = @intCast(v.conditions.len),
+            .name_offset = lay.name_offsets[i],
+            .name_len = @intCast(v.cfg.name.len),
             .is_default = if (v.cfg.match.len == 0) 1 else 0,
         };
     }
@@ -875,6 +1034,7 @@ fn writeFat(
         .variant_count = @intCast(variants.len),
         .format_version = format.format_version,
         .machine = machine,
+        .mode = mode,
     };
 
     var out_file = dir.createFile(io, out_path, .{
@@ -904,6 +1064,9 @@ fn writeFat(
             try w.writeAll(&condition_bytes);
         }
     }
+    for (variants) |v| {
+        try w.writeAll(v.cfg.name);
+    }
     for (entries) |e| {
         const entry_bytes = format.encode(format.VariantEntry, e);
         try w.writeAll(&entry_bytes);
@@ -912,7 +1075,49 @@ fn writeFat(
     try w.writeAll(&footer_bytes);
     try w.flush();
 
+    if (mode == .files and copy_payloads) {
+        try copyPayloads(io, arena, dir, config_dir, out_path, variants);
+    }
+
     return lay;
+}
+
+/// File mode's materialized half: copy each variant's payload beside the
+/// shim as `<output>.d/<variant name>`, mode 0755. The stream re-hashes and
+/// checks the digest — a payload that changed after load fails the pack.
+fn copyPayloads(
+    io: Io,
+    arena: Allocator,
+    dir: Io.Dir,
+    config_dir: Io.Dir,
+    out_path: []const u8,
+    variants: []const LoadedVariant,
+) !void {
+    const payload_dir_path = try arena.print("{s}.d", .{out_path});
+    dir.createDirPath(io, payload_dir_path) catch |err| {
+        logFail(payload_dir_path, "create dir", err);
+        return err;
+    };
+    var payload_dir = dir.openDir(io, payload_dir_path, .{}) catch |err| {
+        logFail(payload_dir_path, "open dir", err);
+        return err;
+    };
+    defer payload_dir.close(io);
+
+    for (variants) |v| {
+        var dest = payload_dir.createFile(io, v.cfg.name, .{
+            .permissions = .fromMode(0o755),
+        }) catch |err| {
+            logFail(v.cfg.name, "create", err);
+            return err;
+        };
+        defer dest.close(io);
+
+        var buffer: [4096]u8 = undefined;
+        var dest_writer: Io.File.Writer = .init(dest, io, &buffer);
+        try streamPayload(io, config_dir, &dest_writer.interface, v.payload);
+        try dest_writer.flush();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -924,11 +1129,12 @@ test "layout: single variant matches the v0 math" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const lay = try layout(arena, 100, &.{0x2000}, &.{0});
+    const lay = try layout(arena, 100, &.{0x2000}, &.{0}, &.{3});
     try testing.expectEqual(@as(u64, 4096), lay.payload_offsets[0]);
-    try testing.expectEqual(@as(u64, 4096 + 0x2000), lay.table_offset);
+    // The 3-byte name sits between the conditions and the table.
+    try testing.expectEqual(@as(u64, 4096 + 0x2000 + 3), lay.table_offset);
     try testing.expectEqual(
-        @as(u64, 4096 + 0x2000 + @sizeOf(format.VariantEntry) + @sizeOf(format.Footer)),
+        @as(u64, 4096 + 0x2000 + 3 + @sizeOf(format.VariantEntry) + @sizeOf(format.Footer)),
         lay.size,
     );
     // One pad between stub and payload.
@@ -941,16 +1147,21 @@ test "layout: two variants with conditions" {
     const arena = arena_state.allocator();
 
     // stub 100B, payload_0 0x2000B starting at 4096, payload_1 10B at
-    // 4096+0x2000 (already page-aligned), conditions 2 then 0.
-    const lay = try layout(arena, 100, &.{ 0x2000, 10 }, &.{ 2, 0 });
+    // 4096+0x2000 (already page-aligned), conditions 2 then 0, names 2 and
+    // 7 bytes.
+    const lay = try layout(arena, 100, &.{ 0x2000, 10 }, &.{ 2, 0 }, &.{ 2, 7 });
     try testing.expectEqual(@as(u64, 4096), lay.payload_offsets[0]);
     try testing.expectEqual(@as(u64, 4096 + 0x2000), lay.payload_offsets[1]);
     const blob_start: u64 = 4096 + 0x2000 + 10;
     try testing.expectEqual(@as(u32, @intCast(blob_start)), lay.condition_offsets[0]);
-    // Zero-count variant points at the same place the table starts.
+    // Zero-count variant points at the start of the name blob.
     const after_two: u64 = blob_start + 2 * @sizeOf(format.Condition);
     try testing.expectEqual(@as(u32, @intCast(after_two)), lay.condition_offsets[1]);
-    const table_offset: u64 = blob_start + 2 * @sizeOf(format.Condition);
+    // Names follow the conditions: "v2" then "generic".
+    const names_start: u64 = blob_start + 2 * @sizeOf(format.Condition);
+    try testing.expectEqual(@as(u32, @intCast(names_start)), lay.name_offsets[0]);
+    try testing.expectEqual(@as(u32, @intCast(names_start + 2)), lay.name_offsets[1]);
+    const table_offset: u64 = names_start + 9;
     try testing.expectEqual(table_offset, lay.table_offset);
     try testing.expectEqual(
         table_offset + 2 * @sizeOf(format.VariantEntry) + @sizeOf(format.Footer),
@@ -1174,7 +1385,7 @@ test "elfCheck: machine + program-ness" {
     try testing.expectError(error.NotAnElf, elfCheck("payload", &not_elf));
 }
 
-test "writeFat: dedups identical payload bytes" {
+test "writeOutput: dedups identical payload bytes" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1197,7 +1408,7 @@ test "writeFat: dedups identical payload bytes" {
     format.writeInt(u16, payload_other[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
     format.writeInt(u64, payload_other[e_entry_off..][0..8], 0x1000);
 
-    // Write the payloads to real files — writeFat streams from paths.
+    // Write the payloads to real files — the writer streams from paths.
     try tmp.dir.writeFile(io, .{ .sub_path = "same", .data = &payload });
     try tmp.dir.writeFile(io, .{ .sub_path = "other", .data = &payload_other });
     const same_ref: PayloadRef = .{
@@ -1233,7 +1444,7 @@ test "writeFat: dedups identical payload bytes" {
         },
     };
 
-    const lay = try writeFat(
+    const lay = try writeOutput(
         io,
         arena,
         tmp.dir,
@@ -1241,7 +1452,9 @@ test "writeFat: dedups identical payload bytes" {
         "fat.bin",
         &payload,
         @backingInt(elf.EM.AARCH64),
+        .embedded,
         &loaded,
+        true,
     );
     var arena2: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena2.deinit();
@@ -1251,9 +1464,9 @@ test "writeFat: dedups identical payload bytes" {
     try testing.expectEqual(@as(u32, 3), footer.variant_count);
     // Entries a and b share the offset; c is distinct.
     const entry_a = try format.decode(format.VariantEntry, fat[@intCast(footer.table_offset)..]);
-    const entry_b_at: usize = @intCast(footer.table_offset + 32);
+    const entry_b_at: usize = @intCast(footer.table_offset + @sizeOf(format.VariantEntry));
     const entry_b = try format.decode(format.VariantEntry, fat[entry_b_at..]);
-    const entry_c_at: usize = @intCast(footer.table_offset + 64);
+    const entry_c_at: usize = @intCast(footer.table_offset + 2 * @sizeOf(format.VariantEntry));
     const entry_c = try format.decode(format.VariantEntry, fat[entry_c_at..]);
     try testing.expectEqual(entry_a.payload_offset, entry_b.payload_offset);
     try testing.expect(entry_c.payload_offset != entry_a.payload_offset);
@@ -1267,7 +1480,7 @@ test "writeFat: dedups identical payload bytes" {
     try testing.expect(lay.size < 4096 + 64 + 4096 + 64 + 3 * 32 + 32 + 4096);
 }
 
-test "writeFat: two-variant round-trip through a real file" {
+test "writeOutput: two-variant round-trip through a real file" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1292,7 +1505,7 @@ test "writeFat: two-variant round-trip through a real file" {
     format.writeInt(u64, payload_1[e_entry_off..][0..8], 0x1000);
 
     const machine = @backingInt(elf.EM.AARCH64);
-    // Payloads by reference — writeFat streams from files, so write the
+    // Payloads by reference — the writer streams from files, so write the
     // bytes out and reference them.
     try tmp.dir.writeFile(io, .{ .sub_path = "p0", .data = &payload_0 });
     try tmp.dir.writeFile(io, .{ .sub_path = "p1", .data = &payload_1 });
@@ -1325,7 +1538,18 @@ test "writeFat: two-variant round-trip through a real file" {
         },
     };
 
-    const lay = try writeFat(io, arena, tmp.dir, tmp.dir, "fat.bin", &stub, machine, &loaded);
+    const lay = try writeOutput(
+        io,
+        arena,
+        tmp.dir,
+        tmp.dir,
+        "fat.bin",
+        &stub,
+        machine,
+        .embedded,
+        &loaded,
+        true,
+    );
     const stat = try tmp.dir.statFile(io, "fat.bin", .{});
     try testing.expectEqual(lay.size, stat.size);
     try testing.expect(stat.permissions.toMode() & 0o111 != 0);
@@ -1364,4 +1588,130 @@ test "writeFat: two-variant round-trip through a real file" {
     try testing.expectEqual(@as(u64, 1 << 1), c0.mask);
     try testing.expectEqual(@as(u64, 1 << 1), c0.expected);
     try testing.expectEqual(format.Source.hwcap2, c0.source);
+}
+
+test "writeOutput: file mode writes a shim and payload files" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const e_type_off = @offsetOf(elf.Elf64_Ehdr, "e_type");
+    const e_machine_off = @offsetOf(elf.Elf64_Ehdr, "e_machine");
+    const e_entry_off = @offsetOf(elf.Elf64_Ehdr, "e_entry");
+
+    const stub: [100]u8 = @splat(0xAA);
+    var payload_0: [300]u8 = @splat(0xB0);
+    payload_0[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
+    format.writeInt(u16, payload_0[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload_0[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
+    format.writeInt(u64, payload_0[e_entry_off..][0..8], 0x1000);
+    var payload_1: [37]u8 = @splat(0xB1);
+    payload_1[0..4].* = .{ 0x7f, 'E', 'L', 'F' };
+    format.writeInt(u16, payload_1[e_type_off..][0..2], @backingInt(elf.ET.EXEC));
+    format.writeInt(u16, payload_1[e_machine_off..][0..2], @backingInt(elf.EM.AARCH64));
+    format.writeInt(u64, payload_1[e_entry_off..][0..8], 0x1000);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "p0", .data = &payload_0 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "p1", .data = &payload_1 });
+    const p0_ref: PayloadRef = .{
+        .path = "p0",
+        .size = payload_0.len,
+        .digest = Wyhash.hash(0, &payload_0),
+    };
+    const p1_ref: PayloadRef = .{
+        .path = "p1",
+        .size = payload_1.len,
+        .digest = Wyhash.hash(0, &payload_1),
+    };
+    const loaded = [_]LoadedVariant{
+        .{
+            .cfg = .{ .name = "v2", .binary = "p0", .match = &.{.{ .bit = .sve2 }} },
+            .payload = p0_ref,
+            .payload_index = 0,
+            .conditions = try compileMatches(arena, .{
+                .name = "v2",
+                .binary = "p0",
+                .match = &.{.{ .bit = .sve2 }},
+            }),
+        },
+        .{
+            .cfg = .{ .name = "generic", .binary = "p1", .match = &.{} },
+            .payload = p1_ref,
+            .payload_index = 1,
+            .conditions = &.{},
+        },
+    };
+
+    const machine = @backingInt(elf.EM.AARCH64);
+    const lay = try writeOutput(
+        io,
+        arena,
+        tmp.dir,
+        tmp.dir,
+        "shim",
+        &stub,
+        machine,
+        .files,
+        &loaded,
+        true,
+    );
+
+    // The shim is stub + conditions + names + table + footer: no payload
+    // bytes at all, so the file stays tiny.
+    const stat = try tmp.dir.statFile(io, "shim", .{});
+    try testing.expectEqual(lay.size, stat.size);
+    try testing.expect(lay.size < 4096);
+    try testing.expect(stat.permissions.toMode() & 0o111 != 0);
+
+    const shim = try readFile(io, arena, tmp.dir, "shim");
+    const footer = try format.findFooter(shim);
+    try testing.expectEqual(Mode.files, footer.mode);
+
+    const entry_0_at: usize = @intCast(footer.table_offset);
+    const entry_1_at: usize = @intCast(footer.table_offset + @sizeOf(format.VariantEntry));
+    const entry_0 = try format.decode(format.VariantEntry, shim[entry_0_at..]);
+    const entry_1 = try format.decode(format.VariantEntry, shim[entry_1_at..]);
+    try testing.expectEqual(@as(u64, 0), entry_0.payload_offset);
+    try testing.expectEqual(@as(u64, payload_0.len), entry_0.payload_size);
+    try testing.expectEqualStrings("v2", shim[entry_0.name_offset..][0..entry_0.name_len]);
+    try testing.expectEqualStrings("generic", shim[entry_1.name_offset..][0..entry_1.name_len]);
+    try testing.expectEqual(@as(u8, 1), entry_1.is_default);
+
+    // The materialized half: <shim>.d/<name>, executable, byte-identical.
+    const copied_0 = try readFile(io, arena, tmp.dir, "shim.d/v2");
+    const copied_1 = try readFile(io, arena, tmp.dir, "shim.d/generic");
+    try testing.expectEqualSlices(u8, &payload_0, copied_0);
+    try testing.expectEqualSlices(u8, &payload_1, copied_1);
+    const payload_stat = try tmp.dir.statFile(io, "shim.d/v2", .{});
+    try testing.expect(payload_stat.permissions.toMode() & 0o111 != 0);
+}
+
+test "validateNames: file mode names are single safe path components" {
+    const ok = [_]NamedVariant{
+        .{ .name = "neoverse_v2", .binary = "a", .match = &.{} },
+        .{ .name = "x86_64-v3", .binary = "b", .match = &.{} },
+    };
+    try validateNames(&ok, .files);
+    try validateNames(&ok, .embedded);
+
+    const slash = [_]NamedVariant{.{ .name = "a/b", .binary = "a", .match = &.{} }};
+    try testing.expectError(error.Config, validateNames(&slash, .files));
+    // Embedded mode carries names for display only.
+    try validateNames(&slash, .embedded);
+
+    const dotdot = [_]NamedVariant{.{ .name = "..", .binary = "a", .match = &.{} }};
+    try testing.expectError(error.Config, validateNames(&dotdot, .files));
+
+    const dup = [_]NamedVariant{
+        .{ .name = "same", .binary = "a", .match = &.{} },
+        .{ .name = "same", .binary = "b", .match = &.{} },
+    };
+    try testing.expectError(error.Config, validateNames(&dup, .files));
+
+    var long_name: [max_name_len + 1]u8 = @splat('x');
+    const long = [_]NamedVariant{.{ .name = &long_name, .binary = "a", .match = &.{} }};
+    try testing.expectError(error.Config, validateNames(&long, .embedded));
 }

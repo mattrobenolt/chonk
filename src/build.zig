@@ -222,8 +222,96 @@ pub const ExecutableOptions = struct {
 /// unless `install = false`.
 ///
 /// One fat binary per species: the skeleton's arch decides, so call once
-/// per arch with that arch's models.
+/// per arch with that arch's models. For separate payload files and a plain
+/// execve at run time, use `addFilesExecutable`.
 pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
+    const prepared = prepare(b, options, .embedded);
+
+    const pack_cmd = b.addRunArtifact(prepared.tool);
+    pack_cmd.addArg("pack");
+    pack_cmd.addFileArg(prepared.stub);
+    pack_cmd.addFileArg(prepared.config);
+    const fat = pack_cmd.addOutputFileArg(options.name);
+
+    if (options.install) {
+        const install = b.addInstallFileWithDir(fat, .bin, options.name);
+        b.getInstallStep().dependOn(&install.step);
+    }
+    return fat;
+}
+
+/// The files-mode door: same options, but the output is a shim plus payload
+/// files that stay separate. The shim carries the variant table and, at run
+/// time, `execve`s `<shim>.d/<variant>` beside itself — no memfd and no
+/// `execveat`, so path-based LSM profiles (AppArmor) can name each payload.
+///
+/// With `install = true`, installs the shim as `zig-out/bin/<name>` and each
+/// payload as `zig-out/bin/<name>.d/<variant name>`. With `install = false`,
+/// installs nothing and returns both pieces so the caller can reproduce that
+/// layout in its own step:
+///
+///     const files = chonk.addFilesExecutable(b, .{ ... .install = false });
+///     const step = b.step("files", "Build the files-mode fleet");
+///     step.dependOn(&b.addInstallFileWithDir(files.shim, .bin, "app").step);
+///     for (files.payloads) |p| {
+///         const install = b.addInstallFileWithDir(
+///             p.path, .bin, b.fmt("app.d/{s}", .{p.name}));
+///         step.dependOn(&install.step);
+///     }
+///
+/// The silent failure mode is installing the shim without its directory (or
+/// under a different basename than the directory): the shim then reports
+/// `execve payload: ENOENT` with the path it tried.
+pub fn addFilesExecutable(b: *Build, options: ExecutableOptions) FilesExecutable {
+    const prepared = prepare(b, options, .files);
+
+    // --no-copy: the payloads are installed from the compile artifacts, so
+    // the packer writes only the shim.
+    const pack_cmd = b.addRunArtifact(prepared.tool);
+    pack_cmd.addArg("pack");
+    pack_cmd.addArg("--files");
+    pack_cmd.addArg("--no-copy");
+    pack_cmd.addFileArg(prepared.stub);
+    pack_cmd.addFileArg(prepared.config);
+    const shim = pack_cmd.addOutputFileArg(options.name);
+
+    const payloads = b.allocator.alloc(Payload, prepared.variants.len) catch @panic("OOM");
+    for (prepared.variants, 0..) |t, i| {
+        payloads[i] = .{ .name = t.name, .path = prepared.payloads[i] };
+    }
+
+    if (options.install) {
+        const install_shim = b.addInstallFileWithDir(shim, .bin, options.name);
+        b.getInstallStep().dependOn(&install_shim.step);
+        for (payloads) |payload| {
+            const install = b.addInstallFileWithDir(
+                payload.path,
+                .bin,
+                b.fmt("{s}.d/{s}", .{ options.name, payload.name }),
+            );
+            b.getInstallStep().dependOn(&install.step);
+        }
+    }
+
+    return .{ .shim = shim, .payloads = payloads };
+}
+
+/// What both doors share: validate the options, resolve the fleet onto the
+/// skeleton, compile every variant, run post_process, and stage the config
+/// the packer reads. `mode` selects the stub artifact.
+const Prepared = struct {
+    variants: []const ResolvedTarget,
+    /// Post-processed payload binaries, one per variant, in table order.
+    payloads: []const LazyPath,
+    /// The generated config naming the payload copies.
+    config: LazyPath,
+    /// The species stub for the mode, copied into the generated directory.
+    stub: LazyPath,
+    /// The `chonk` CLI, which does the actual pack.
+    tool: *Step.Compile,
+};
+
+fn prepare(b: *Build, options: ExecutableOptions, mode: pack.Mode) Prepared {
     if (options.targets.len == 0) {
         @panic("chonk.addExecutable: list at least one variant target — " ++
             "the arch-baseline fallback is appended automatically");
@@ -328,26 +416,23 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         }
     }
 
-    // The stub for THIS species, compiled by chonk's own build (always
-    // ReleaseSmall + stripped, compiled once for every consumer). The
-    // skeleton's resolved arch decides.
+    // The stub for THIS species and mode, compiled by chonk's own build
+    // (always ReleaseSmall + stripped, compiled once for every consumer).
+    // The skeleton's resolved arch decides.
     const dep = b.dependency("chonk", .{});
     const species = b.resolveTargetQuery(options.target).result.cpu.arch;
-    const stub = dep.artifact(switch (species) {
-        .aarch64 => "stub-aarch64",
-        .x86_64 => "stub-x86_64",
-        else => @panic("chonk.addExecutable: unsupported arch"),
-    });
+    const stub = dep.artifact(stubArtifact(species, mode));
 
     // The pack is the CLI's work: 0.17 executes a fixed set of steps by tag,
     // so a build script has no way to run code itself. The payloads and the
     // stub are copied into one generated directory beside a config that
-    // names them, and `chonk pack` writes the fat binary as the run step's
-    // output file. The run step's manifest hashes the argv, the copied
-    // payloads, the stub, and the config text, so a changed payload, match,
-    // or stub re-packs.
+    // names them, and `chonk pack` writes the output as the run step's
+    // file. The run step's manifest hashes the argv, the copied payloads,
+    // the stub, and the config text, so a changed payload, match, or stub
+    // re-packs.
     const files = b.addWriteFiles();
     const files_variants = b.allocator.alloc(pack.Variant, variants.len) catch @panic("OOM");
+    const payloads = b.allocator.alloc(LazyPath, variants.len) catch @panic("OOM");
     for (variants, 0..) |t, i| {
         var payload = exes[i].getEmittedBin();
         if (options.post_process) |post| {
@@ -357,6 +442,7 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
                 .optimize = options.optimize,
             }, payload);
         }
+        payloads[i] = payload;
         const sub_path = b.fmt("payload-{d}", .{i});
         _ = files.addCopyFile(payload, sub_path);
         files_variants[i] = .{
@@ -370,18 +456,42 @@ pub fn addExecutable(b: *Build, options: ExecutableOptions) LazyPath {
         pack.configZon(b.allocator, .{ .variants = files_variants }),
     );
 
-    const pack_cmd = b.addRunArtifact(dep.artifact("chonk"));
-    pack_cmd.addArg("pack");
-    pack_cmd.addFileArg(files.addCopyFile(stub.getEmittedBin(), "stub"));
-    pack_cmd.addFileArg(config);
-    const fat = pack_cmd.addOutputFileArg(options.name);
-
-    if (options.install) {
-        const install = b.addInstallFileWithDir(fat, .bin, options.name);
-        b.getInstallStep().dependOn(&install.step);
-    }
-    return fat;
+    return .{
+        .variants = variants,
+        .payloads = payloads,
+        .config = config,
+        .stub = files.addCopyFile(stub.getEmittedBin(), "stub"),
+        .tool = dep.artifact("chonk"),
+    };
 }
+
+/// The stub artifact for a species and trailer mode. File mode builds a
+/// separate stub so its exec path (plain execve of a path) and the embedded
+/// path (memfd + execveat) never share a binary.
+fn stubArtifact(arch: Target.Cpu.Arch, mode: pack.Mode) []const u8 {
+    return switch (arch) {
+        .aarch64 => if (mode == .files) "stub-aarch64-files" else "stub-aarch64",
+        .x86_64 => if (mode == .files) "stub-x86_64-files" else "stub-x86_64",
+        else => @panic("chonk.addExecutable: unsupported arch"),
+    };
+}
+
+/// One payload file in files mode.
+pub const Payload = struct {
+    /// The variant name, which is also the file name under `<shim>.d/`.
+    name: []const u8,
+    /// The compiled (and post-processed) payload binary.
+    path: LazyPath,
+};
+
+/// What `addFilesExecutable` returns: the shim and the payload files it
+/// execs. Install the shim as `bin/<name>` and each payload as
+/// `bin/<name>.d/<payload.name>` — anywhere else and the shim cannot find
+/// them.
+pub const FilesExecutable = struct {
+    shim: LazyPath,
+    payloads: []const Payload,
+};
 
 /// One resolved target: the auto-name, the resolved query, the inferred
 /// dispatch bits, and whether it is the arch-baseline fallback.

@@ -58,7 +58,8 @@ pub fn main(init: std.process.Init) !u8 {
 const top_usage =
     \\usage: chonk <command> [args]
     \\  chonk pack <stub> <config.zon> <output>  pack a fat binary from a config
-    \\  chonk inspect <binary>                   print a fat binary's variant table
+    \\  chonk pack --files <stub> <config> <shim>  write a file-mode shim + payloads
+    \\  chonk inspect <binary>                   print a chonk file's variant table
     \\  chonk --help                             print this help
     \\
 ;

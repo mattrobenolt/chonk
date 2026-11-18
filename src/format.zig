@@ -11,7 +11,23 @@ const testing = std.testing;
 /// Footer magic: `"CHONKv01"` little-endian.
 pub const magic: u64 = 0x3130_764b_4e4f_4843;
 
-pub const format_version: u32 = 2;
+pub const format_version: u32 = 3;
+
+/// Where the payloads live. The stub is compiled per mode; a stub refuses a
+/// trailer that records the other one.
+pub const Mode = enum(u8) {
+    /// Payload ELFs are embedded after the stub. The stub streams the
+    /// matched payload into a memfd and `execveat`s it (`AT_EMPTY_PATH`).
+    embedded = 0,
+    /// Payload ELFs are separate files beside the shim, resolved as
+    /// `<shim>.d/<variant name>`. The stub `execve`s the path — no memfd,
+    /// no `execveat`, so path-based LSM profiles (AppArmor) can mediate it.
+    files = 1,
+};
+
+/// The longest variant name the format carries. File mode also uses it as
+/// the shim's name-buffer bound, so pack-time and run-time limits agree.
+pub const max_name_len: usize = 255;
 
 /// Payload alignment within the fat file: absolute file offset must be a
 /// multiple of this. Absolute (not relative) so mmap-based dispatch stays
@@ -57,7 +73,9 @@ pub const Footer = extern struct {
     /// the stub's own ELF header; the stub validates it against its own
     /// arch before trusting anything else in the file.
     machine: u16,
-    _pad: [6]u8 = @splat(0),
+    /// Embedded payloads or files beside the shim.
+    mode: Mode,
+    _pad: [5]u8 = @splat(0),
 };
 
 /// One per variant, in match order (table order = config file order).
@@ -65,14 +83,21 @@ pub const Footer = extern struct {
 /// `is_default != 0` matches unconditionally; the packer validates that
 /// exactly one such variant exists.
 pub const VariantEntry = extern struct {
-    /// Absolute file offset of the payload ELF. Multiple of `page_size`.
+    /// Absolute file offset of the payload ELF. Multiple of `page_size` in
+    /// embedded mode; zero in file mode, where payloads are not in this
+    /// file.
     payload_offset: u64,
     payload_size: u64,
     /// Absolute file offset of `Condition[0]` for this variant.
     condition_offset: u32,
     condition_count: u32,
+    /// Absolute file offset of this variant's name bytes (no terminator).
+    /// File mode resolves `<shim>.d/<name>`; embedded mode carries the name
+    /// for display only.
+    name_offset: u32,
+    name_len: u16,
     is_default: u8,
-    _pad: [7]u8 = @splat(0),
+    _pad: [1]u8 = @splat(0),
 };
 
 /// One condition. A variant matches when all of its conditions pass — AND
@@ -94,7 +119,7 @@ pub const Error = error{
     Truncated,
     BadMagic,
     UnsupportedVersion,
-    InvalidSource,
+    InvalidEnumValue,
 };
 
 comptime {
@@ -103,9 +128,12 @@ comptime {
     assert(@sizeOf(Footer) == 32);
     assert(@offsetOf(Footer, "table_offset") == 8);
     assert(@offsetOf(Footer, "machine") == 24);
+    assert(@offsetOf(Footer, "mode") == 26);
     assert(@sizeOf(VariantEntry) == 32);
     assert(@offsetOf(VariantEntry, "payload_size") == 8);
-    assert(@offsetOf(VariantEntry, "is_default") == 24);
+    assert(@offsetOf(VariantEntry, "name_offset") == 24);
+    assert(@offsetOf(VariantEntry, "name_len") == 28);
+    assert(@offsetOf(VariantEntry, "is_default") == 30);
     assert(@sizeOf(Condition) == 24);
     assert(@offsetOf(Condition, "expected") == 8);
     assert(@offsetOf(Condition, "source") == 16);
@@ -167,7 +195,7 @@ fn enumFromByte(comptime E: type, raw: u8) Error!E {
     inline for (@typeInfo(E).@"enum".field_values) |field_value| {
         if (field_value == raw) return @fromBackingInt(raw);
     }
-    return error.InvalidSource;
+    return error.InvalidEnumValue;
 }
 
 pub inline fn readInt(comptime T: type, buffer: *const [@divExact(@typeInfo(T).int.bits, 8)]u8) T {
@@ -203,13 +231,14 @@ test "footer encode pins little-endian byte layout" {
         .variant_count = 0x090a_0b0c,
         .format_version = 0x0d0e_0f10,
         .machine = 0x1415,
+        .mode = .files,
     };
     const bytes = encode(Footer, footer);
     try testing.expectEqualSlices(u8, &[_]u8{
         'C',  'H',  'O',  'N',  'K',  'v',  '0',  '1',
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
         0x0c, 0x0b, 0x0a, 0x09, 0x10, 0x0f, 0x0e, 0x0d,
-        0x15, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x15, 0x14, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     }, &bytes);
 }
 
@@ -220,6 +249,7 @@ test "footer round-trip" {
         .variant_count = 3,
         .format_version = format_version,
         .machine = 0xb7,
+        .mode = .files,
     };
     const bytes = encode(Footer, footer);
     try testing.expectEqual(footer, try decode(Footer, &bytes));
@@ -231,6 +261,8 @@ test "variant entry round-trip" {
         .payload_size = 0x1000,
         .condition_offset = 0x20,
         .condition_count = 2,
+        .name_offset = 0x40,
+        .name_len = 11,
         .is_default = 1,
     };
     const bytes = encode(VariantEntry, entry);
@@ -258,11 +290,22 @@ test "XCR0 condition pins source 4 and the unchanged record layout" {
     try testing.expectEqual(condition, try decode(Condition, &bytes));
 }
 
-test "decode rejects unknown source" {
+test "decode rejects unknown enum value" {
     const bytes = encode(Condition, .{ .source = .hwcap, .mask = 0, .expected = 0 });
     var corrupt = bytes;
     corrupt[@offsetOf(Condition, "source")] = 99;
-    try testing.expectError(error.InvalidSource, decode(Condition, &corrupt));
+    try testing.expectError(error.InvalidEnumValue, decode(Condition, &corrupt));
+    const footer = encode(Footer, .{
+        .magic = magic,
+        .table_offset = 0,
+        .variant_count = 0,
+        .format_version = format_version,
+        .machine = 0xb7,
+        .mode = .embedded,
+    });
+    var bad_mode = footer;
+    bad_mode[@offsetOf(Footer, "mode")] = 99;
+    try testing.expectError(error.InvalidEnumValue, decode(Footer, &bad_mode));
 }
 
 test "decode rejects truncated buffer" {
@@ -272,6 +315,7 @@ test "decode rejects truncated buffer" {
         .variant_count = 0,
         .format_version = format_version,
         .machine = 0xb7,
+        .mode = .embedded,
     });
     try testing.expectError(error.Truncated, decode(Footer, bytes[0 .. bytes.len - 1]));
 }
@@ -284,6 +328,7 @@ test "findFooter at EOF" {
         .variant_count = 2,
         .format_version = format_version,
         .machine = @backingInt(std.elf.EM.AARCH64),
+        .mode = .embedded,
     };
     const footer_bytes = encode(Footer, footer);
     var fat: [payload.len + footer_bytes.len]u8 = undefined;
@@ -302,6 +347,7 @@ test "findFooter rejects short file, bad magic, bad version" {
         .variant_count = 0,
         .format_version = 1,
         .machine = 0xb7,
+        .mode = .embedded,
     });
     try testing.expectError(error.UnsupportedVersion, findFooter(&old_version));
     const wrong_version = encode(Footer, .{
@@ -310,6 +356,7 @@ test "findFooter rejects short file, bad magic, bad version" {
         .variant_count = 0,
         .format_version = format_version + 1,
         .machine = 0xb7,
+        .mode = .embedded,
     });
     try testing.expectError(error.UnsupportedVersion, findFooter(&wrong_version));
 }

@@ -1,9 +1,9 @@
-//! `chonk inspect <binary>` — the `unzip -l` of fat binaries: decode the
-//! trailer and print the variant table in human form. Names never touch the
-//! wire, so everything shown is reverse-mapped from the wire bytes through
-//! chonk's vocabulary; anything the vocabulary does not know prints raw.
-//! The trailer is untrusted input, same as the stub — every region is
-//! bounds-checked before it is decoded.
+//! `chonk inspect <binary>` — the `unzip -l` of chonk files: decode the
+//! trailer and print the variant table in human form. Variant names are on
+//! the wire (file mode needs them as file names), conditions are
+//! reverse-mapped through chonk's vocabulary; anything the vocabulary does
+//! not know prints raw. The trailer is untrusted input, same as the stub —
+//! every region is bounds-checked before it is decoded.
 
 const std = @import("std");
 const Io = std.Io;
@@ -60,11 +60,17 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
         return 1;
     };
 
-    stdout.print("{s}: chonk fat binary\n", .{path});
+    stdout.print("{s}: chonk {s}\n", .{
+        path,
+        if (footer.mode == .files) "file-mode shim" else "fat binary",
+    });
     stdout.print(
-        "  format version {d}, machine {s}, {d} variants, total {d} bytes",
+        "  format version {d}, machine {s}, {d} variants, total {d} bytes\n",
         .{ footer.format_version, machineName(footer.machine), footer.variant_count, fat.len },
     );
+    if (footer.mode == .files) {
+        stdout.print("\n  payloads resolve beside the shim as <shim>.d/<name>\n", .{});
+    }
 
     // Entry table: variant_count entries at table_offset, all before the
     // footer. Widen before arithmetic — the trailer is untrusted.
@@ -78,30 +84,55 @@ pub fn run(io: Io, arena: Allocator, args: *cli.Args) !u8 {
         const at: usize = @intCast(footer.table_offset + i * @sizeOf(format.VariantEntry));
         const entry = try format.decode(format.VariantEntry, fat[at..]);
 
+        // Names live before the entry table, ending where it starts — the
+        // same bound the stub enforces. The trailer is untrusted input.
+        if (@as(u64, entry.name_offset) + entry.name_len > footer.table_offset) {
+            stderr.print("chonk: {s}: variant name out of range\n", .{path});
+            return 1;
+        }
+        const name = fat[entry.name_offset..][0..entry.name_len];
+
         // Dedup is visible right here: identical payload bytes share an
-        // offset. Annotate repeats.
+        // offset. Annotate repeats. File-mode entries all carry offset 0,
+        // so the annotation is embedded-only.
         var shared = false;
-        for (0..i) |j| {
-            const prev_at: usize = @intCast(footer.table_offset + j * @sizeOf(format.VariantEntry));
-            const prev = try format.decode(format.VariantEntry, fat[prev_at..]);
-            if (prev.payload_offset == entry.payload_offset and
-                prev.payload_size == entry.payload_size) shared = true;
+        if (footer.mode == .embedded) {
+            for (0..i) |j| {
+                const prev_at: usize =
+                    @intCast(footer.table_offset + j * @sizeOf(format.VariantEntry));
+                const prev = try format.decode(format.VariantEntry, fat[prev_at..]);
+                if (prev.payload_offset == entry.payload_offset and
+                    prev.payload_size == entry.payload_size) shared = true;
+            }
         }
         const fallback = if (entry.is_default != 0 or entry.condition_count == 0)
             ", fallback"
         else
             "";
-        stdout.print(
-            "  {d}: payload @ {d} ({d} bytes, {d} condition(s){s}{s})\n",
-            .{
-                i,
-                entry.payload_offset,
-                entry.payload_size,
-                entry.condition_count,
-                fallback,
-                if (shared) ", shared" else "",
-            },
-        );
+        switch (footer.mode) {
+            .embedded => stdout.print(
+                "  {d}: {s}: payload @ {d} ({d} bytes, {d} condition(s){s}{s})\n",
+                .{
+                    i,
+                    name,
+                    entry.payload_offset,
+                    entry.payload_size,
+                    entry.condition_count,
+                    fallback,
+                    if (shared) ", shared" else "",
+                },
+            ),
+            .files => stdout.print(
+                "  {d}: {s} ({d} bytes, {d} condition(s){s})\n",
+                .{
+                    i,
+                    name,
+                    entry.payload_size,
+                    entry.condition_count,
+                    fallback,
+                },
+            ),
+        }
 
         // Conditions: count records at condition_offset, ending before the
         // entry table — the same constraint the stub enforces.
