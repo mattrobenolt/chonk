@@ -264,12 +264,12 @@ stubs refuse new trailers at run time.
 
 ## Requirements
 
-- Zig 0.16.0 (`nix develop` supplies it)
+- Zig 0.17.1 (`nix develop` supplies it)
 - Linux, aarch64 or x86_64
 
 ## Development
 
-`nix develop` supplies Zig 0.16, `just`, and qemu-user. `just` runs the
+`nix develop` supplies Zig 0.17, `just`, and qemu-user. `just` runs the
 full e2e battery — `tests/e2e.sh`, a plain bash script: both pack doors,
 the qemu tier matrix, the factory example, and the error paths. The host
 arch picks the native legs; the qemu legs run everywhere. CI runs the
